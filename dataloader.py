@@ -9,26 +9,29 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from PIL import Image
 import torch
+import torch.nn.functional as F
 import torch.utils.data as data
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
+import numpy as np
 
 
 class DDTI(data.Dataset):
     """
-    DDTI-style dataset for loading ultrasound images.
+    DDTI-style dataset for loading ultrasound images and masks for nodule segmentation.
     Based on the DDTI dataloader from TRFE-Net for thyroid nodule segmentation.
-    Adapted for self-supervised learning (no labels required).
     
     Expected directory structure:
         root/
             image/
                 *.jpg, *.png, etc.
+            masks/
+                *.jpg, *.png, etc. (same filenames as images)
     
     Args:
-        root: Root directory containing 'image' subdirectory
-        transform: Optional transform to apply to images (works on dict with 'image' key)
+        root: Root directory containing 'image' and 'masks' subdirectories
+        transform: Optional transform to apply to images and masks (works on dict with 'image' and 'mask' keys)
         return_size: Whether to return image size in the sample
     """
     
@@ -42,6 +45,11 @@ class DDTI(data.Dataset):
         if not os.path.exists(image_dir):
             raise ValueError(f"Image directory does not exist: {image_dir}")
         
+        # Get masks directory
+        masks_dir = os.path.join(root, 'mask')
+        if not os.path.exists(masks_dir):
+            raise ValueError(f"Masks directory does not exist: {masks_dir}")
+        
         # Get all image files
         img_names = os.listdir(image_dir)
         # Sort by numeric value if filenames are numeric
@@ -51,31 +59,45 @@ class DDTI(data.Dataset):
             # If not numeric, use alphabetical sort
             img_names = sorted(img_names)
         
-        self.img_names = img_names
+        # Filter to only include images that have corresponding masks
+        valid_img_names = []
+        for img_name in img_names:
+            mask_path = os.path.join(masks_dir, img_name)
+            if os.path.exists(mask_path):
+                valid_img_names.append(img_name)
+            else:
+                print(f"Warning: No mask found for {img_name}, skipping")
+        
+        self.img_names = valid_img_names
         
         if len(self.img_names) == 0:
-            raise ValueError(f"No images found in {image_dir}")
+            raise ValueError(f"No valid image-mask pairs found in {image_dir} and {masks_dir}")
         
-        print(f"Found {len(self.img_names)} images in {image_dir}")
+        print(f"Found {len(self.img_names)} image-mask pairs")
     
     def __getitem__(self, index: int) -> Dict:
         """
-        Get an image by index.
+        Get an image and mask by index.
         
         Args:
             index: Index of the image
             
         Returns:
-            Dictionary with 'image' key containing the transformed image tensor [3, H, W]
+            Dictionary with 'image' and 'mask' keys containing transformed tensors
             and optionally 'size' and 'image_name' keys
         """
         img_name = self.img_names[index]
         image_path = os.path.join(self.root, 'image', img_name)
+        mask_path = os.path.join(self.root, 'mask', img_name)
         
         assert os.path.exists(image_path), f'{image_path} does not exist'
+        assert os.path.exists(mask_path), f'{mask_path} does not exist'
         
         # Load image as RGB
         image = Image.open(image_path).convert('RGB')
+        
+        # Load mask as grayscale (L mode)
+        mask = Image.open(mask_path).convert('L')
         
         # Store original size if needed
         if self.return_size:
@@ -83,7 +105,7 @@ class DDTI(data.Dataset):
             size = (h, w)
         
         # Create sample dictionary (DDTI-style)
-        sample = {'image': image}
+        sample = {'image': image, 'mask': mask}
         
         # Apply transform if provided (transform should work on dict)
         if self.transform:
@@ -92,7 +114,9 @@ class DDTI(data.Dataset):
             # Default: convert to tensor
             to_tensor = transforms.ToTensor()
             image_tensor = to_tensor(sample['image'])  # [3, H, W] for RGB
+            mask_tensor = to_tensor(sample['mask'])  # [1, H, W] for grayscale
             sample['image'] = image_tensor
+            sample['mask'] = mask_tensor
         
         # Ensure image is 3-channel tensor (should already be RGB)
         if isinstance(sample['image'], torch.Tensor):
@@ -103,6 +127,27 @@ class DDTI(data.Dataset):
                 else:
                     raise ValueError(f"Unexpected number of channels: {sample['image'].size(0)}")
         
+        # After transform, ensure all values are tensors or other collatable types
+        # Check if transform returned only image (for mean/std calculation)
+        if 'mask' not in sample:
+            # Transform already cleaned up the sample (e.g., for mean/std calculation)
+            # Just ensure image is a tensor
+            if not isinstance(sample['image'], torch.Tensor):
+                to_tensor = transforms.ToTensor()
+                sample['image'] = to_tensor(sample['image'])
+        else:
+            # Normal case: ensure mask is single channel (only if mask is present and is a tensor)
+            if isinstance(sample['mask'], torch.Tensor):
+                if sample['mask'].dim() == 3 and sample['mask'].size(0) > 1:
+                    # Take first channel if multiple channels
+                    sample['mask'] = sample['mask'][0:1]
+            elif isinstance(sample['mask'], Image.Image):
+                # Convert mask to tensor if it's still a PIL Image
+                to_tensor = transforms.ToTensor()
+                mask_tensor = to_tensor(sample['mask'])
+                sample['mask'] = mask_tensor
+        
+        # Only add non-tensor fields if they're needed and won't cause collation issues
         if self.return_size:
             sample['size'] = torch.tensor(size)
         
@@ -299,13 +344,29 @@ def calculate_mean_std_ddti(
     def simple_transform(sample):
         """Simple transform for mean/std calculation."""
         img = sample['image']
-        transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor()  # Converts RGB to [3, H, W]
-        ])
-        img_tensor = transform(img)
-        sample['image'] = img_tensor
-        return sample
+        # Ensure it's a PIL Image
+        if not isinstance(img, Image.Image):
+            if isinstance(img, torch.Tensor):
+                # Already a tensor, just resize if needed
+                if img.shape[-1] != image_size or img.shape[-2] != image_size:
+                    img = F.interpolate(img.unsqueeze(0), size=(image_size, image_size), mode='bilinear', align_corners=False).squeeze(0)
+                img_tensor = img
+            else:
+                img = Image.fromarray(np.array(img))
+                transform = transforms.Compose([
+                    transforms.Resize((image_size, image_size)),
+                    transforms.ToTensor()  # Converts RGB to [3, H, W]
+                ])
+                img_tensor = transform(img)
+        else:
+            transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor()  # Converts RGB to [3, H, W]
+            ])
+            img_tensor = transform(img)
+        
+        # Return only image tensor (no mask needed for statistics)
+        return {'image': img_tensor}
     
     # Create dataset
     dataset = DDTI(root=root, transform=simple_transform, return_size=False)

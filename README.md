@@ -10,9 +10,11 @@ pip install -r requirements.txt
 
 ## Project Structure
 
-- `dataloader.py`: Module for loading ultrasound images from folders
+- `dataloader.py`: Module for loading ultrasound images and masks from folders
 - `fine_tune_dinov2.py`: Module for fine-tuning DinoV2 with self-supervised learning
-- `train.py`: Main training script
+- `segmentation_model.py`: Module for nodule segmentation using DinoV2 backbone
+- `train.py`: Main training script for self-supervised learning
+- `train_segmentation.py`: Training script for nodule segmentation
 - `visualize_data.py`: Module for visualizing and inspecting dataloader data
 
 ## Usage
@@ -100,12 +102,51 @@ train_model(
 )
 ```
 
-## Self-Supervised Learning
+## Training Modes
+
+### Self-Supervised Learning (`train.py`)
 
 The model uses contrastive learning (InfoNCE loss) where:
 - Two augmented views of the same image are created
 - The model learns to produce similar representations for augmented views of the same image
 - Different images should have different representations
+
+### Nodule Segmentation (`train_segmentation.py`)
+
+Supervised learning for nodule segmentation:
+- Uses DinoV2 as backbone feature extractor
+- Decoder head upsamples features to pixel-level segmentation
+- Combined loss: Dice loss + Binary Cross Entropy
+- Requires masks in `masks/` folder (same directory as `image/` folder)
+
+**Directory structure for segmentation:**
+```
+data/
+  train/
+    image/
+      *.jpg, *.png, etc.
+    masks/
+      *.jpg, *.png, etc. (same filenames as images)
+  val/
+    image/
+      *.jpg, *.png, etc.
+    masks/
+      *.jpg, *.png, etc.
+```
+
+**Example usage:**
+```python
+from train_segmentation import train_segmentation_model
+
+model = train_segmentation_model(
+    train_root='./data/train',
+    val_root='./data/val',
+    batch_size=16,
+    epochs=50,
+    learning_rate=1e-4,
+    visualize_every=5  # Visualize results every 5 epochs
+)
+```
 
 ## Modules
 
