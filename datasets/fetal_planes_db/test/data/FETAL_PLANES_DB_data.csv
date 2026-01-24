@@ -1,0 +1,3 @@
+Image_name;Patient_num;Plane;Brain_plane;Operator;US_Machine;Train
+A;1;Other;Not A Brain;Other;Aloka;1
+B;1;Other;Some;Other;Test;0
