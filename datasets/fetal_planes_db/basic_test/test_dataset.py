@@ -10,9 +10,13 @@ from PIL import Image
 import numpy as np
 
 import sys
+import os
 # Add parent directory to path to import dataset
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from dataset import FetalPlanesDBDataset
+# sys.path.insert(0, str(Path(__file__).parent.parent))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+source_dir = os.path.abspath(os.path.join(current_dir, ".."))
+sys.path.append(source_dir)
+from fpd_dataset import FetalPlanesDBDataset
 
 
 class TestFetalPlanesDBDataset(unittest.TestCase):
