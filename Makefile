@@ -29,3 +29,7 @@ test-fetal-head-circ:
 # Run tests for fetal_planes_db dataset
 test-fetal-planes:
 	$(PYTEST) datasets/fetal_planes_db/basic_test/ -v
+
+# Run tests for cyclegan
+test-cycle-gan:
+	$(PYTEST) domain_adaptation/cyclegan/ -v
