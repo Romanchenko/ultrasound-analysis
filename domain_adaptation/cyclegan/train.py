@@ -241,10 +241,6 @@ class CycleGANTrainer:
             real_a = real_a.to(self.device)
             real_b = real_b.to(self.device)
             
-            # Adversarial ground truths
-            valid = torch.ones(real_a.size(0), 1, 1, 1, device=self.device, requires_grad=False)
-            fake = torch.zeros(real_a.size(0), 1, 1, 1, device=self.device, requires_grad=False)
-            
             # ===================
             # Train Generators
             # ===================
@@ -254,8 +250,16 @@ class CycleGANTrainer:
             fake_b, fake_a, rec_a, rec_b, idt_a, idt_b = self.model(real_a, real_b)
             
             # GAN loss
-            loss_G_A2B = self.criterion_gan(self.model.D_B(fake_b), valid)
-            loss_G_B2A = self.criterion_gan(self.model.D_A(fake_a), valid)
+            # Get discriminator outputs for generated images
+            pred_fake_b = self.model.D_B(fake_b)
+            pred_fake_a = self.model.D_A(fake_a)
+            
+            # Create matching target tensors
+            valid_target_b = torch.ones_like(pred_fake_b)
+            valid_target_a = torch.ones_like(pred_fake_a)
+            
+            loss_G_A2B = self.criterion_gan(pred_fake_b, valid_target_b)
+            loss_G_B2A = self.criterion_gan(pred_fake_a, valid_target_a)
             loss_GAN = (loss_G_A2B + loss_G_B2A) / 2
             
             # Cycle consistency loss
@@ -280,9 +284,15 @@ class CycleGANTrainer:
             self.optimizer_D_A.zero_grad()
             
             # Real loss
-            loss_real = self.criterion_gan(self.model.D_A(real_a), valid)
+            pred_real_a = self.model.D_A(real_a)
+            valid_target_a = torch.ones_like(pred_real_a)
+            loss_real = self.criterion_gan(pred_real_a, valid_target_a)
+            
             # Fake loss
-            loss_fake = self.criterion_gan(self.model.D_A(fake_a.detach()), fake)
+            pred_fake_a = self.model.D_A(fake_a.detach())
+            fake_target_a = torch.zeros_like(pred_fake_a)
+            loss_fake = self.criterion_gan(pred_fake_a, fake_target_a)
+            
             # Total loss
             loss_D_A = (loss_real + loss_fake) / 2
             
@@ -295,9 +305,15 @@ class CycleGANTrainer:
             self.optimizer_D_B.zero_grad()
             
             # Real loss
-            loss_real = self.criterion_gan(self.model.D_B(real_b), valid)
+            pred_real_b = self.model.D_B(real_b)
+            valid_target_b = torch.ones_like(pred_real_b)
+            loss_real = self.criterion_gan(pred_real_b, valid_target_b)
+            
             # Fake loss
-            loss_fake = self.criterion_gan(self.model.D_B(fake_b.detach()), fake)
+            pred_fake_b = self.model.D_B(fake_b.detach())
+            fake_target_b = torch.zeros_like(pred_fake_b)
+            loss_fake = self.criterion_gan(pred_fake_b, fake_target_b)
+            
             # Total loss
             loss_D_B = (loss_real + loss_fake) / 2
             
