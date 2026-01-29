@@ -126,7 +126,7 @@ class Discriminator(nn.Module):
             *discriminator_block(128, 256),
             *discriminator_block(256, 512),
             nn.ZeroPad2d((1, 0, 1, 0)),
-            nn.Conv2d(512, 1, 4, padding=1)
+            nn.Conv2d(512, 1, 3, padding=1)
         )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
