@@ -31,6 +31,8 @@ class FetalPlanesDBDataset(Dataset):
         csv_file: Name of the CSV file (default: 'FETAL_PLANES_DB_data.csv')
         images_dir: Name of images directory (default: 'images')
         train: If True, load training set; if False, load validation set; if None, load all (default: None)
+        class_to_idx: Optional mapping from Brain_plane class names to indices for classification.
+                      If provided, __getitem__ will return 'label_idx' instead of 'label' dict.
     """
     
     def __init__(
@@ -40,12 +42,15 @@ class FetalPlanesDBDataset(Dataset):
         target_size: tuple = (224, 224),
         csv_file: str = 'FETAL_PLANES_DB_data.csv',
         images_dir: str = 'images',
-        train: Optional[bool] = None
+        train: Optional[bool] = None,
+        class_to_idx: Optional[Dict[str, int]] = None
     ):
         self.root = Path(root)
         self.images_dir = self.root / images_dir
         self.csv_path = self.root / csv_file
         self.target_size = target_size
+        self.class_to_idx = class_to_idx
+        self.idx_to_class = {v: k for k, v in class_to_idx.items()} if class_to_idx else None
         
         # Load CSV file
         if not self.csv_path.exists():
@@ -69,10 +74,16 @@ class FetalPlanesDBDataset(Dataset):
             image_path = self.images_dir / f"{image_name}.png"
             
             if image_path.exists():
+                brain_plane = row.get('Brain_plane', '')
+                
+                # If class_to_idx is provided, filter out unknown classes
+                if class_to_idx is not None and brain_plane not in class_to_idx:
+                    continue
+                
                 self.image_paths.append(image_path)
                 # Store relevant metadata
                 self.labels.append({
-                    'Brain_plane': row.get('Brain_plane', ''),
+                    'Brain_plane': brain_plane,
                     'Plane': row.get('Plane', ''),
                     'Patient_num': row.get('Patient_num', ''),
                     'Image_name': image_name
@@ -133,6 +144,7 @@ class FetalPlanesDBDataset(Dataset):
             Dictionary with:
                 - 'image': Image tensor [1, H, W] (grayscale)
                 - 'label': Dictionary with metadata (Brain_plane, Plane, Patient_num, Image_name)
+                           OR 'label_idx': Integer label index (if class_to_idx is provided)
         """
         image_path = self.image_paths[idx]
         label = self.labels[idx]
@@ -159,10 +171,22 @@ class FetalPlanesDBDataset(Dataset):
             # If multiple channels, take first channel (shouldn't happen for grayscale)
             image = image[0:1]
         
-        return {
-            'image': image,
-            'label': label
-        }
+        # Return format depends on whether class_to_idx is provided
+        if self.class_to_idx is not None:
+            # Classification mode: return label_idx
+            brain_plane = label['Brain_plane']
+            label_idx = self.class_to_idx[brain_plane]
+            return {
+                'image': image,
+                'label_idx': torch.tensor(label_idx, dtype=torch.long),
+                'label_name': brain_plane
+            }
+        else:
+            # Default mode: return full label dict
+            return {
+                'image': image,
+                'label': label
+            }
     
     def get_class_counts(self, label_key: str = 'Brain_plane') -> dict:
         """
