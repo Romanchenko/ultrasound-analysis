@@ -40,6 +40,7 @@ class CycleGANTranslatedDataset(Dataset):
         device: Optional[torch.device] = None,
         return_source: bool = False,
         post_transform: Optional[Callable] = None,
+        b2a: bool = False,
     ):
         """
         Args:
@@ -53,7 +54,7 @@ class CycleGANTranslatedDataset(Dataset):
                             tensor *after* generation (e.g. denormalization,
                             clipping, dtype conversion).
         """
-        self.generator = cyclegan_model.G_A2B
+        self.generator = cyclegan_model.G_A2B if not b2a else cyclegan_model.G_B2A
         self.generator.eval()
 
         self.source_dataset = source_dataset
