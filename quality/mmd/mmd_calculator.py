@@ -1,5 +1,11 @@
 """
-MMD (Maximum Mean Discrepancy) calculator using ResNet-50 embeddings.
+MMD (Maximum Mean Discrepancy) calculator.
+
+Supports multiple feature-extraction backbones via the shared
+``quality.feature_extractor`` module:
+    - 'resnet50'    : ImageNet pretrained ResNet-50
+    - 'radimagenet' : RadImageNet pretrained ResNet-50 (from Keras H5)
+    - nn.Module     : any custom feature extractor
 
 MMD measures the distance between two probability distributions by
 comparing their mean embeddings in a reproducing kernel Hilbert space
@@ -13,13 +19,12 @@ the distributions are identical (in the RKHS sense).
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset
-from typing import Optional, List
+from typing import Optional, List, Union
 
-from quality.fid.fid_calculator import (
-    extract_features,
-    get_resnet50_features_model,
-)
+from quality.fid.fid_calculator import extract_features
+from quality.feature_extractor import get_features_model
 
 
 # -----------------------------------------------------------------------
@@ -167,6 +172,8 @@ def calculate_mmd(
 def calculate_mmd_from_datasets(
     dataset1: Dataset,
     dataset2: Dataset,
+    model_name: Union[str, nn.Module] = 'resnet50',
+    weights_path: Optional[str] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     device: Optional[torch.device] = None,
@@ -174,17 +181,20 @@ def calculate_mmd_from_datasets(
     bandwidths: Optional[List[float]] = None,
 ) -> float:
     """
-    Calculate MMD between two PyTorch datasets using ResNet-50 embeddings.
+    Calculate MMD between two PyTorch datasets.
 
     Args:
-        dataset1:    First PyTorch Dataset.
-        dataset2:    Second PyTorch Dataset.
-        batch_size:  Batch size for feature extraction.
-        num_workers: Number of DataLoader workers.
-        device:      Device to run ResNet-50 on (auto-detected if None).
-        image_size:  Input image size for ResNet-50 (default 224).
-        bandwidths:  Explicit kernel bandwidths.  If None, the median
-                     heuristic is used.
+        dataset1:     First PyTorch Dataset.
+        dataset2:     Second PyTorch Dataset.
+        model_name:   Backbone selector (``'resnet50'``, ``'radimagenet'``,
+                      or an ``nn.Module``).
+        weights_path: Path to weight file (required for ``'radimagenet'``).
+        batch_size:   Batch size for feature extraction.
+        num_workers:  Number of DataLoader workers.
+        device:       Device (auto-detected when *None*).
+        image_size:   Input image size for the backbone.
+        bandwidths:   Explicit kernel bandwidths.  If None, the median
+                      heuristic is used.
 
     Returns:
         MMD² score (lower is better; 0 means identical distributions).
@@ -195,9 +205,14 @@ def calculate_mmd_from_datasets(
     print("Calculating MMD between two datasets...")
     print(f"Dataset 1: {len(dataset1)} samples")
     print(f"Dataset 2: {len(dataset2)} samples")
+    print(f"Feature extractor: {model_name if isinstance(model_name, str) else type(model_name).__name__}")
 
     # Load model once and share across both extractions
-    model = get_resnet50_features_model(device)
+    model = get_features_model(
+        model_name=model_name,
+        device=device,
+        weights_path=weights_path,
+    )
 
     print("\nExtracting features from dataset 1...")
     features1 = extract_features(
@@ -227,4 +242,3 @@ def calculate_mmd_from_datasets(
     )
 
     return mmd_score
-

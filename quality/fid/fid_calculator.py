@@ -1,45 +1,28 @@
 """
-FID (Frechet Inception Distance) calculator using ResNet-50 embeddings.
+FID (Frechet Inception Distance) calculator.
+
+Supports multiple feature-extraction backbones via the shared
+``quality.feature_extractor`` module:
+    - 'resnet50'    : ImageNet pretrained ResNet-50
+    - 'radimagenet' : RadImageNet pretrained ResNet-50 (from Keras H5)
+    - nn.Module     : any custom feature extractor
 """
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torchvision.models import resnet50, ResNet50_Weights
 from torchvision import transforms
-from typing import Optional
+from typing import Optional, Union
 import numpy as np
 from tqdm import tqdm
 from scipy import linalg
 
-
-def get_resnet50_features_model(device: Optional[torch.device] = None):
-    """
-    Get ResNet-50 model for feature extraction.
-    
-    Args:
-        device: Device to load model on
-        
-    Returns:
-        ResNet-50 model with classification head removed
-    """
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Load pretrained ResNet-50
-    model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-    
-    # Remove classification head, keep only feature extractor
-    model = nn.Sequential(*list(model.children())[:-1])
-    model.eval()
-    model = model.to(device)
-    
-    return model
+from quality.feature_extractor import get_features_model
 
 
 def prepare_image_transform(image_size: int = 224):
     """
-    Create transform to prepare images for ResNet-50.
+    Create transform to prepare images for feature extraction.
     Handles grayscale images by converting to RGB.
     
     Args:
@@ -100,33 +83,52 @@ def prepare_image_transform(image_size: int = 224):
 def extract_features(
     dataset: Dataset,
     model: Optional[nn.Module] = None,
+    model_name: Union[str, nn.Module] = 'resnet50',
+    weights_path: Optional[str] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     device: Optional[torch.device] = None,
     image_size: int = 224
 ) -> np.ndarray:
     """
-    Extract features from dataset using ResNet-50.
-    
+    Extract features from a dataset.
+
+    The feature-extraction backbone is chosen via *model_name*:
+        - ``'resnet50'``     – ImageNet pretrained ResNet-50
+        - ``'radimagenet'``  – RadImageNet (requires *weights_path*)
+        - ``nn.Module``      – a custom model
+
+    If *model* is provided directly it takes precedence over *model_name*
+    (for backward compatibility).
+
     Args:
-        dataset: PyTorch Dataset instance
-        model: Optional pretrained model (if None, ResNet-50 will be loaded)
-        batch_size: Batch size for feature extraction
-        num_workers: Number of worker processes
-        device: Device to run on (auto-detected if None)
-        image_size: Target image size for ResNet-50
-        
+        dataset:      PyTorch Dataset instance.
+        model:        (deprecated) Pre-built model.  Prefer *model_name*.
+        model_name:   Backbone selector (see above).
+        weights_path: Path to weight file (required for ``'radimagenet'``).
+        batch_size:   Batch size for feature extraction.
+        num_workers:  Number of DataLoader workers.
+        device:       Device (auto-detected when *None*).
+        image_size:   Input image size for the backbone.
+
     Returns:
-        Numpy array of features [num_samples, feature_dim]
+        Numpy array of features ``[num_samples, feature_dim]``.
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     print(f"Using device: {device}")
     
-    # Load model if not provided
-    if model is None:
-        model = get_resnet50_features_model(device)
+    # Resolve model
+    if model is not None:
+        # Caller supplied a ready model (backward compat)
+        pass
+    else:
+        model = get_features_model(
+            model_name=model_name,
+            device=device,
+            weights_path=weights_path,
+        )
     
     # Create transform
     transform_fn = prepare_image_transform(image_size)
@@ -229,6 +231,8 @@ def calculate_fid(
 def calculate_fid_from_datasets(
     dataset1: Dataset,
     dataset2: Dataset,
+    model_name: Union[str, nn.Module] = 'resnet50',
+    weights_path: Optional[str] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     device: Optional[torch.device] = None,
@@ -238,15 +242,18 @@ def calculate_fid_from_datasets(
     Calculate FID between two datasets.
     
     Args:
-        dataset1: First PyTorch Dataset
-        dataset2: Second PyTorch Dataset
-        batch_size: Batch size for feature extraction
-        num_workers: Number of worker processes
-        device: Device to run on (auto-detected if None)
-        image_size: Target image size for ResNet-50
+        dataset1:     First PyTorch Dataset.
+        dataset2:     Second PyTorch Dataset.
+        model_name:   Backbone selector (``'resnet50'``, ``'radimagenet'``,
+                      or an ``nn.Module``).
+        weights_path: Path to weight file (required for ``'radimagenet'``).
+        batch_size:   Batch size for feature extraction.
+        num_workers:  Number of DataLoader workers.
+        device:       Device (auto-detected when *None*).
+        image_size:   Input image size for the backbone.
         
     Returns:
-        FID score
+        FID score.
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -254,9 +261,14 @@ def calculate_fid_from_datasets(
     print(f"Calculating FID between two datasets...")
     print(f"Dataset 1: {len(dataset1)} samples")
     print(f"Dataset 2: {len(dataset2)} samples")
+    print(f"Feature extractor: {model_name if isinstance(model_name, str) else type(model_name).__name__}")
     
     # Load model once
-    model = get_resnet50_features_model(device)
+    model = get_features_model(
+        model_name=model_name,
+        device=device,
+        weights_path=weights_path,
+    )
     
     # Extract features from both datasets
     print("\nExtracting features from dataset 1...")
@@ -284,4 +296,3 @@ def calculate_fid_from_datasets(
     fid_score = calculate_fid(features1, features2)
     
     return fid_score
-
