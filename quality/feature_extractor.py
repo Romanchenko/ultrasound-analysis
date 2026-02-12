@@ -121,18 +121,25 @@ def _get_radimagenet(weights_path: str, device: torch.device) -> nn.Module:
             f"Expected .h5, .hdf5, or .pt"
         )
 
-    # Build a blank ResNet-50 and load the converted weights
+    # Build a blank ResNet-50 and load the converted weights.
+    # We strip the FC head *before* loading so that weights files without
+    # a prediction layer (e.g. Keras ``_notop`` models) work out of the box.
     model = resnet50(weights=None)
-    # RadImageNet may have a different number of output classes;
-    # match the FC layer if needed
-    fc_weight = state_dict.get('fc.weight')
-    if fc_weight is not None and fc_weight.shape[0] != 1000:
-        num_classes = fc_weight.shape[0]
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
+
+    has_fc = 'fc.weight' in state_dict
+    if has_fc:
+        # Match the FC size if it differs from the default 1000 classes
+        fc_weight = state_dict['fc.weight']
+        if fc_weight.shape[0] != 1000:
+            model.fc = nn.Linear(model.fc.in_features, fc_weight.shape[0])
+    else:
+        # No FC in the weight file — remove it from the model so
+        # load_state_dict doesn't complain about missing keys.
+        model.fc = nn.Identity()
 
     model.load_state_dict(state_dict, strict=True)
 
-    # Remove classification head
+    # Remove classification head (FC / Identity) → keep up to avgpool
     model = nn.Sequential(*list(model.children())[:-1])
     model.eval()
     return model.to(device)
