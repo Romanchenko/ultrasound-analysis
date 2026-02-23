@@ -1,0 +1,163 @@
+{
+    "Бедренная кость": {
+        "id": 0,
+        "prompts": [
+            "A longitudinal ultrasound image demonstrates the fetal femur as a straight, highly echogenic structure with smooth cortical margins and posterior acoustic shadowing.",
+            "The fetal femur is visualized as a bright, linear bone within the lower limb, showing normal length and uniform ossification for the gestational age.",
+            "On grayscale sonography, the fetal femur appears as a hyperechoic shaft surrounded by soft tissue, without bowing, fracture, or cortical irregularity.",
+            "The image shows the fetal femur in profile with clearly defined proximal and distal ends and homogeneous echogenicity throughout the diaphysis.",
+            "A transverse ultrasound view depicts the fetal femur as a rounded, echogenic focus with an intact cortex and normal adjacent soft tissue appearance."
+        ]
+    },
+    "Поперечное сечение головы на уровне ППП и четверохолмия": {
+        "id": 1,
+        "prompts": [
+            "A transverse ultrasound image at the level of the superior colliculus demonstrates the fetal head with symmetric cerebral hemispheres, intact calvarial margins, and centrally located midline structures.",
+            "The fetal head cross-section shows the mesencephalic region with the superior colliculus visible posterior to the thalamic structures and normal surrounding brain parenchyma.",
+            "On grayscale sonography, the superior colliculus is identified within the midbrain, with preserved symmetry and no evidence of ventricular dilatation or mass effect.",
+            "The image depicts a standard axial plane of the fetal head at the level of the superior colliculus, characterized by normal skull contour and appropriate echogenicity of intracranial structures.",
+            "A transverse section of the fetal head reveals the superior colliculus within the posterior midbrain, with intact calvarium and normal appearance of adjacent brain tissue."
+        ]
+    },
+    "Поперечное сечение головы на уровне мозжечка": {
+        "id": 2,
+        "prompts": [
+            "A transverse ultrasound image at the level of the cerebellum demonstrates symmetric cerebellar hemispheres connected by the echogenic vermis, with intact calvarial margins and normal posterior fossa appearance.",
+            "The fetal head cross-section shows the cerebellum in the posterior fossa, characterized by a bilobed configuration and appropriate size for gestational age.",
+            "On grayscale sonography, the cerebellar hemispheres and vermis are clearly visualized, with no evidence of enlargement of the cisterna magna or distortion of posterior fossa structures.",
+            "The axial image depicts the fetal cerebellum with well-defined contours, symmetric hemispheres, and normal surrounding intracranial anatomy.",
+            "A transverse section at the cerebellar level reveals intact skull contour, homogeneous echogenicity of the cerebellar tissue, and normal posterior fossa configuration."
+        ]
+    },
+    "Сагиттальная плоскость: профиль": {
+        "id": 3,
+        "prompts": [
+            "A sagittal ultrasound image demonstrates the fetal spine as a well-defined, echogenic structure with normal bony alignment and posterior acoustic shadowing.",
+            "The fetal spine is visualized as a straight, linear bone within the axial plane, showing normal length and appropriate ossification for the gestational age.",
+            "On grayscale sonography, the spine appears as a hyperechoic structure surrounded by soft tissue, without evidence of curvature or fracture.",
+            "The image shows the fetal spine in profile, characterized by uniform echogenicity and clear visualization of both proximal and distal ends.",
+            "A sagittal section of the fetal spine reveals the spine as a straight, linear bone with intact cortical margins and normal adjacent soft tissue appearance."
+        ]
+    },
+    "Желудок": {
+        "id": 5,
+        "prompts": [
+            "Transverse grayscale sonographic image of the fetal upper abdomen demonstrates a well-defined, anechoic fluid-filled stomach in the left upper quadrant, confirming normal fetal swallowing function and esophageal patency.",
+            "Axial B-mode ultrasound image through the fetal abdomen reveals a distended, echo-free gastric bubble in the expected left-sided position, with smooth wall margins and no evidence of intraluminal debris or abnormal adjacent structures.",
+            "Transverse sonographic image of the fetal abdomen at the level of the umbilical vein demonstrates a normal-appearing, anechoic stomach in the left upper quadrant, appropriately sized for gestational age with no evidence of duplication or obstruction.",
+            "Real-time grayscale ultrasound depicts a clearly visible, fluid-filled fetal stomach occupying its expected position in the left hemabdomen, with a thin echogenic wall, homogeneous anechoic contents, and no associated polyhydramnios or intra-abdominal anomalies identified.",
+            "Longitudinal sonographic image of the fetal upper abdomen reveals an oval, anechoic gastric structure with well-defined echogenic walls in normal left-sided situs, with no evidence of pyloric narrowing, double-bubble sign, or aberrant positioning suggestive of situs abnormality."
+        ]
+    },
+    "Мочевой пузырь в режиме ЦДК'": {
+        "id": 6,
+        "prompts": [
+            "Transverse color Doppler sonographic image of the fetal pelvis demonstrates a well-defined, anechoic urinary bladder in the midline, flanked bilaterally by the umbilical arteries displaying characteristic low-resistance pulsatile flow, confirming normal bladder vascularization and fetal circulatory integrity.",
+            "Axial color Doppler ultrasound image through the fetal pelvis reveals a fluid-filled bladder of normal volume for gestational age, with paired umbilical arteries demonstrating symmetric, patent flow along the lateral bladder walls, forming the classic 'three-vessel' pelvic appearance.",
+            "Longitudinal pulsed-wave Doppler sonographic image of the fetal lower abdomen depicts a distended, thin-walled urinary bladder with normal end-diastolic flow identified in the adjacent umbilical arteries, indicating appropriate downstream placental resistance and no evidence of obstructive uropathy.",
+            "Color flow Doppler ultrasound in a transverse plane through the fetal pelvis demonstrates a normally positioned, anechoic bladder with bilateral umbilical artery flow signals mapping along its lateral margins, with no turbulence, posterior urethral jet abnormality, or perilesional vascularity identified.",
+            "Real-time color Doppler sonographic image of the fetal pelvis reveals an appropriately filled urinary bladder in the midline with symmetrical umbilical artery signals on either side showing normal systolic-to-diastolic ratios, and no evidence of bladder wall thickening, keyhole sign, or ureteral jets suggesting obstructive pathology."
+        ]
+    },
+    "Фронтальная плоскость: носогубный треугольник": {
+        "id": 7,
+        "prompts": [
+            "Coronal grayscale sonographic image of the fetal face demonstrates a intact nasolabial triangle with clearly visualized, symmetric nostrils, well-defined philtrum, and continuous primary palate, with no evidence of cleft lip or nasal structural anomaly.",
+            "Frontal B-mode ultrasound image of the fetal midface reveals a normally formed nasolabial triangle with symmetric nasal alae, intact upper lip contour, and no disruption of the soft tissue echogenicity pattern suggestive of unilateral or bilateral cleft lip deformity.",
+            "Coronal sonographic image obtained at the level of the fetal nose and upper lip demonstrates a well-defined, symmetric nasolabial triangle with intact echogenic soft tissue bridges bilaterally, patent nares, and no hypoechoic discontinuity of the primary palate or upper lip.",
+            "Real-time grayscale ultrasound in a coronal plane depicts the fetal nasolabial triangle with normal triangular soft tissue morphology, symmetrical nostril openings, continuous upper lip margin, and preserved echogenicity of the underlying alveolar ridge, with no clefting identified.",
+            "High-resolution coronal sonographic image of the fetal face reveals an intact nasolabial triangle with bilaterally symmetric nasal tip, well-visualized columella, uninterrupted upper lip echogenicity, and no evidence of premaxillary protrusion or soft tissue defect consistent with cleft lip with or without palate involvement."
+        ]
+    },
+    "Плечевая кость": {
+        "id": 8,
+        "prompts": [
+            "A longitudinal ultrasound view demonstrates the fetal humerus as a straight, echogenic tubular structure with well-defined cortical margins and posterior acoustic shadowing.",
+            "The fetal humerus appears as a bright, linear bone within the upper limb, with smooth contours and symmetric ossification relative to gestational age.",
+            "On grayscale ultrasound, the fetal humerus is visualized as a hyperechoic shaft surrounded by soft tissue, without evidence of angulation or discontinuity.",
+            "The image shows the fetal humerus in profile, characterized by uniform echogenicity and clear visualization of both proximal and distal ends.",
+            "A transverse sonographic section depicts the fetal humerus as a rounded, echogenic focus with intact cortex and normal adjacent musculature."
+        ]
+    },
+    "Продольная плоскость: позвоночник": {
+        "id": 9,
+        "prompts": [
+            "A longitudinal ultrasound image demonstrates the fetal spine as a well-defined, echogenic structure with normal bony alignment and posterior acoustic shadowing.",
+            "The fetal spine is visualized as a straight, linear bone within the axial plane, showing normal length and appropriate ossification for the gestational age.",
+            "On grayscale sonography, the spine appears as a hyperechoic structure surrounded by soft tissue, without evidence of curvature or fracture.",
+            "The image shows the fetal spine in profile, characterized by uniform echogenicity and clear visualization of both proximal and distal ends.",
+            "A sagittal section of the fetal spine reveals the spine as a straight, linear bone with intact cortical margins and normal adjacent soft tissue appearance."
+        ]
+    },
+    "Почки": {
+        "id": 10,
+        "prompts": [
+            "Transverse grayscale sonographic image of the fetal abdomen demonstrates bilateral renal structures flanking the lumbar spine, with normal echogenicity, preserved corticomedullary differentiation, and no evidence of pelvicalyceal dilatation.",
+            "Longitudinal B-mode ultrasound image of the fetal flank reveals an oval, well-defined kidney with echogenic renal sinus, hypoechoic medullary pyramids, and a cortical echogenicity slightly greater than the adjacent fetal liver, consistent with normal fetal renal appearance.",
+            "Axial sonographic image through the fetal retroperitoneum demonstrates symmetrically sized kidneys in their expected paraspinal location, with intact renal capsules, normal corticomedullary differentiation, and no hydronephrosis or increased renal pelvic diameter.",
+            "Real-time grayscale ultrasound in a parasagittal plane depicts a fetal kidney with a bean-shaped morphology, smooth outer contour, mildly echogenic cortex relative to adjacent structures, and no evidence of cysts, masses, or collecting system dilatation.",
+            "Longitudinal sonographic image of the fetal retroperitoneum shows a normally developing kidney with well-defined margins, visible medullary pyramids appearing as discrete hypoechoic foci within the renal parenchyma, and no abnormal pelvic or ureteral dilatation identified."
+        ]
+    },
+    "Место прикрепления пуповины к передней брюшной стенке": {
+        "id":11,
+        "prompts": [
+            "Grayscale sonographic image of the fetal anterior abdominal wall demonstrates a normal, centrally positioned umbilical cord insertion site with intact periumbilical echogenic soft tissues and smooth transition between the cord and the fetal skin surface, with no evidence of abdominal wall defect.",
+            "Longitudinal B-mode ultrasound image at the level of the fetal umbilicus reveals a normally inserting umbilical cord surrounded by echogenic Wharton's jelly, with intact anterior abdominal wall soft tissues and no herniation of abdominal viscera through the umbilical ring.",
+            "Transverse grayscale sonographic image of the fetal abdomen demonstrates a midline umbilical cord insertion with normal echogenic periumbilical skin and subcutaneous layers, no membrane-covered mass at the cord base, and no discontinuity of the anterior abdominal wall suggesting omphalocele or gastroschisis.",
+            "Real-time B-mode ultrasound at the level of the fetal anterior abdominal wall depicts a well-defined umbilical cord insertion site with smooth periumbilical contour, intact echogenic skin margins, and no bowel or liver structures identifiable outside the abdominal cavity at the cord entry point.",
+            "Coronal grayscale sonographic image of the fetal abdomen reveals a normally positioned umbilical cord inserting into an intact anterior abdominal wall, with preserved echogenicity of the periumbilical soft tissues and no evidence of a periumbilical defect or extracorporeal herniation of intra-abdominal contents."
+        ]
+    },
+    "Место прикрепления пуповины к плаценте": {
+        "id": 12,
+        "prompts": [
+            "Grayscale sonographic image of the placenta demonstrates a centrally positioned umbilical cord insertion with normal echogenic Wharton's jelly-ensheathed vessels entering the placental substance, surrounded by homogeneous placental parenchyma and no evidence of marginal or velamentous cord insertion.",
+            "Longitudinal B-mode ultrasound image of the placenta reveals a normal umbilical cord attachment site with smooth transition between the cord and placental surface, intact overlying chorionic plate, and no periinsertion abnormalities such as subchorionic hematoma or cystic change.",
+            "Transverse grayscale sonographic image of the placental surface demonstrates a well-defined umbilical cord insertion site with echogenic cord structures entering the placental parenchyma in a central location, with no evidence of circumvallate placentation or abnormal cord course along the membranes.",
+            "Real-time B-mode ultrasound image of the placenta depicts a normally inserting umbilical cord with clearly visible transition point at the chorionic plate, homogeneous placental echotexture in the periinsertion region, and no marginal positioning of the cord suggestive of increased risk for vasa previa.",
+            "Coronal grayscale sonographic image of the placenta reveals an umbilical cord inserting into the placental parenchyma with a well-defined echogenic insertion point, no abnormal membrane-based cord course, and preserved placental thickness and echotexture in the surrounding periinsertion area."
+        ]
+    },
+    "Срез через три сосуда и трахею": {
+        "id": 13,
+        "prompts": [
+            "Transverse grayscale sonographic image of the fetal upper mediastinum demonstrates the three-vessel and trachea view with a normally aligned pulmonary artery, aorta, and superior vena cava arranged in a straight line from left to right with progressively decreasing caliber, and the trachea visible as an echogenic ring to the right of the aorta.",
+            "Axial B-mode ultrasound image at the level of the fetal upper chest reveals the expected three-vessel trachea view with normally sized and positioned main pulmonary artery, transverse aortic arch, and superior vena cava, with the trachea identified as a hyperechoic circular structure in its expected right paramedian position.",
+            "Transverse grayscale sonographic image through the fetal superior mediastinum depicts the three-vessel trachea view with a V-shaped vascular configuration formed by the converging pulmonary artery and ductal arch on the left and the aortic arch on the right, with the trachea visible as an echogenic ring anterior to the spine and no evidence of vascular disproportion or aberrant vessel.",
+            "Real-time B-mode ultrasound image of the fetal upper mediastinum demonstrates the three-vessel trachea view with normal left-sided aortic arch, appropriately sized pulmonary artery measuring larger than the aorta, superior vena cava as the smallest and most rightward structure, and a clearly visible echogenic tracheal ring in the expected midline position.",
+            "Axial grayscale sonographic image at the level of the fetal ductal arch reveals the three-vessel trachea view with preserved vascular hierarchy, normal spatial relationships between the main pulmonary artery, aorta, and superior vena cava, and the trachea appearing as a discrete echogenic circular structure to the right of the aortic arch with no evidence of vascular ring or tracheal displacement."
+        ]
+    },
+    "Четырехкамерный срез сердца": {
+        "id":14,
+        "prompts": [
+            "A transverse ultrasound image demonstrates the fetal heart in the four-chamber view, showing symmetric right and left atria and ventricles with intact atrioventricular septal alignment.",
+            "The fetal cardiac four-chamber view reveals normal chamber size and morphology, with clear visualization of the interventricular septum and appropriately positioned atrioventricular valves.",
+            "On grayscale sonography, the four-chamber slice shows balanced ventricular dimensions, smooth endocardial borders, and no evidence of septal defect or pericardial effusion.",
+            "The image depicts the fetal heart with well-defined atrial and ventricular cavities, normal cardiac axis, and preserved myocardial contractility.",
+            "A standard four-chamber view demonstrates concordant atrioventricular connections, intact septa, and homogeneous myocardial echogenicity.",
+            "A transverse grayscale ultrasound image of the fetal thorax demonstrates a four-chamber view of the fetal heart with symmetric right and left ventricles, intact interventricular septum, and normal-appearing atrioventricular valves in appropriate situs.",
+            "Axial sonographic image at the level of the fetal chest reveals a normally positioned four-chamber heart occupying approximately one-third of the thoracic area, with equal biventricular size and no obvious septal defects identified.",
+            "Real-time B-mode ultrasound demonstrates a four-chamber fetal cardiac view with the cardiac apex directed toward the left, symmetrical atria and ventricles, and echogenic atrioventricular valve leaflets appearing structurally intact.",
+            "Transverse sonographic section through the fetal thorax shows a four-chamber cardiac view with preserved interventricular and interatrial septa, normal cardiac axis, and no evidence of chamber disproportion or pericardial effusion.",
+            "Grayscale ultrasound image of the fetal chest in a transverse plane depicts a four-chamber heart in levocardia, with both atrioventricular valves visible, symmetrical ventricular walls, and no gross structural anomalies identified."
+        ]
+    },
+    "Шейка матки": {
+        "id":15,
+        "prompts": [
+            "A translabial ultrasound image demonstrates the cervix in longitudinal view, with clear visualization of the endocervical canal and closed internal and external os.",
+            "The prenatal translabial scan shows the cervix as a hypoechoic tubular structure with well-defined echogenic margins and normal length.",
+            "On grayscale translabial sonography, the cervical canal appears straight and intact, without evidence of funneling or shortening.",
+            "The image depicts the cervix in sagittal orientation relative to the bladder and lower uterine segment, with preserved cervical architecture.",
+            "A translabial prenatal ultrasound section reveals a normal-appearing cervix with homogeneous stroma and no signs of dilatation or dynamic change"
+        ]
+    },
+    
+    "Допплерометрия": 4,
+    "Другой срез": 4,
+    "Другое сечение головы": 4,
+    "3D-реконструкция": 4,
+    "Не пренатальная диагностика": 4
+}
