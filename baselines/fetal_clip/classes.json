@@ -154,10 +154,24 @@
             "A translabial prenatal ultrasound section reveals a normal-appearing cervix with homogeneous stroma and no signs of dilatation or dynamic change"
         ]
     },
-    
-    "Допплерометрия": 4,
-    "Другой срез": 4,
-    "Другое сечение головы": 4,
-    "3D-реконструкция": 4,
-    "Не пренатальная диагностика": 4
+    "3D-реконструкция": {
+        "id": 4,
+        "prompts": [
+            "A three-dimensional ultrasound reconstruction demonstrates the fetal face with well-defined contours, including the forehead, nose, lips, and chin.",
+            "The 3D volume-rendered image shows the fetus in utero with normal body proportions and smooth surface anatomy.",
+            "A reconstructed 3D ultrasound view depicts the fetal profile with clear visualization of facial features and normal craniofacial morphology.",
+            "The 3D ultrasound image illustrates the fetus in a neutral position, with intact limbs and normal external anatomical appearance.",
+            "A surface-rendered 3D ultrasound reconstruction demonstrates the fetal head and upper torso, with preserved symmetry and no visible external abnormalities."
+        ]
+    },
+    "Не пренатальная диагностика": {
+        "id":4,
+        "prompts": [
+            "A grayscale ultrasound image demonstrates a well-defined, oval hypoechoic lesion within the soft tissue, with smooth margins and posterior acoustic enhancement.",
+            "The sonographic examination shows a homogeneous parenchymal organ with normal echotexture and no focal masses or ductal dilatation.",
+            "On ultrasound, a cystic structure is visualized as an anechoic area with thin walls and increased through-transmission.",
+            "The image depicts a vascular structure in longitudinal section, with anechoic lumen and intact, regular walls.",
+            "A transverse ultrasound view reveals normal tissue architecture, without focal abnormality, calcification, or shadowing."
+        ]
+    }
 }
