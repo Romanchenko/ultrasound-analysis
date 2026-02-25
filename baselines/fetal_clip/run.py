@@ -12,9 +12,9 @@ from tqdm import tqdm
 from torchmetrics import Accuracy, F1Score
 
 # Constants and Configuration
-DIR_IMAGES = "<path_to_images>"
-PATH_CSV = "../processed_iter_1.csv"
-PATH_FETALCLIP_WEIGHT = "../FetalCLIP_weights.pt"
+DIR_IMAGES = "/home/jupyter/datasphere/project/ultrasound/datasetss/fetal_planes_db/Images"
+PATH_CSV = "/home/jupyter/datasphere/project/ultrasound/ultrasound-analysis/baselines/fetal_clip/fetal_planes.csv"
+PATH_FETALCLIP_WEIGHT = "/home/jupyter/datasphere/project/ultrasound/models/FetalCLIP_weights.pt"
 PATH_FETALCLIP_CONFIG = "./fetal_clip_config.json"
 PATH_TEXT_PROMPTS = "./classes.json"
 BATCH_SIZE = 16
