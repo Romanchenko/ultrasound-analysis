@@ -5,21 +5,24 @@ import torch
 import numpy as np
 import pandas as pd
 import open_clip
+import pydicom
 
 from PIL import Image
 
 from tqdm import tqdm
 from torchmetrics import Accuracy, F1Score
 
-# Constants and Configuration
-DIR_IMAGES = "/home/jupyter/datasphere/project/ultrasound/datasetss/fetal_planes_db/Images"
-PATH_CSV = "/home/jupyter/datasphere/project/ultrasound/ultrasound-analysis/baselines/fetal_clip/fetal_planes.csv"
-PATH_FETALCLIP_WEIGHT = "/home/jupyter/datasphere/project/ultrasound/models/FetalCLIP_weights.pt"
-PATH_FETALCLIP_CONFIG = "./fetal_clip_config.json"
-PATH_TEXT_PROMPTS = "./classes.json"
-BATCH_SIZE = 16
-NUM_WORKERS = 4
-IMAGE_EXT = ".png"
+
+# Constants and Configuration (all paths overridable via env vars)
+DIR_IMAGES = os.environ.get("DIR_IMAGES", "<path_to_images>")
+PATH_CSV = os.environ.get("PATH_CSV", "../processed_iter_1.csv")
+PATH_FETALCLIP_WEIGHT = os.environ.get("PATH_FETALCLIP_WEIGHT", "../FetalCLIP_weights.pt")
+PATH_FETALCLIP_CONFIG = os.environ.get("PATH_FETALCLIP_CONFIG", "./fetal_clip_config.json")
+PATH_TEXT_PROMPTS = os.environ.get("PATH_TEXT_PROMPTS", "./classes.json")
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
+IMAGE_EXT = os.environ.get("IMAGE_EXT", "")
+
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -87,37 +90,71 @@ class DatasetProcessed(torch.utils.data.Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-        img = Image.open(self.data[index]['img'])
+        img = load_dicom_as_pil(self.data[index]['img'])
         img = make_image_square_with_zero_padding(img)
         img = self.preprocess(img)
         class_idx = self.data[index]['class_idx']
 
         return img, class_idx, self.data[index]['img']
 
+
+def load_dicom_as_pil(path):
+    """Read a DICOM file and return an RGB PIL Image."""
+    ds = pydicom.dcmread(path)
+    arr = ds.pixel_array  # numpy array
+
+    # Apply modality LUT / VOI LUT if available
+    if hasattr(pydicom.pixel_data_handlers, 'apply_voi_lut'):
+        from pydicom.pixel_data_handlers.util import apply_voi_lut
+        arr = apply_voi_lut(arr, ds)
+
+    # Normalize to 0-255 uint8
+    arr = arr.astype(np.float32)
+    arr -= arr.min()
+    denom = arr.max()
+    if denom > 0:
+        arr = arr / denom
+    arr = (arr * 255).astype(np.uint8)
+
+    # Handle PhotometricInterpretation
+    photometric = getattr(ds, 'PhotometricInterpretation', 'MONOCHROME2')
+    if photometric == 'MONOCHROME1':
+        arr = 255 - arr
+
+    # Convert to PIL RGB
+    if arr.ndim == 2:
+        img = Image.fromarray(arr, mode='L').convert('RGB')
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        img = Image.fromarray(arr, mode='RGB')
+    elif arr.ndim == 3 and arr.shape[2] == 4:
+        img = Image.fromarray(arr, mode='RGBA').convert('RGB')
+    else:
+        # Fallback: take first channel
+        img = Image.fromarray(arr[:, :, 0] if arr.ndim == 3 else arr, mode='L').convert('RGB')
+
+    return img
+
+
 def make_image_square_with_zero_padding(image):
     width, height = image.size
 
-    # Determine the size of the square
     max_side = max(width, height)
 
-    # Create a new square image with black padding (0 for black in RGB or L modes)
     if image.mode == 'RGBA':
         image = image.convert('RGB')
 
-    # Create a new square image with black padding (0 for black in RGB or L modes)
     if image.mode == "RGB":
-        padding_color = (0, 0, 0)  # Black for RGB images
+        padding_color = (0, 0, 0)
     elif image.mode == "L":
-        padding_color = 0  # Black for grayscale images
+        padding_color = 0
+    else:
+        padding_color = 0
 
-    # Create a new square image
     new_image = Image.new(image.mode, (max_side, max_side), padding_color)
 
-    # Calculate padding
     padding_left = (max_side - width) // 2
     padding_top = (max_side - height) // 2
 
-    # Paste the original image in the center of the new square image
     new_image.paste(image, (padding_left, padding_top))
 
     return new_image

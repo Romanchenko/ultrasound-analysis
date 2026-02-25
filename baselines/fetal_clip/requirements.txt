@@ -1,0 +1,9 @@
+torch>=2.0
+open_clip_torch>=2.24
+pydicom
+Pillow
+numpy
+pandas
+tqdm
+torchmetrics
+
