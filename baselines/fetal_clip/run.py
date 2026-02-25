@@ -12,6 +12,7 @@ from PIL import Image
 from tqdm import tqdm
 from torchmetrics import Accuracy, F1Score
 
+
 # Constants and Configuration (all paths overridable via env vars)
 DIR_IMAGES = os.environ.get("DIR_IMAGES", "<path_to_images>")
 PATH_CSV = os.environ.get("PATH_CSV", "../processed_iter_1.csv")
@@ -21,6 +22,7 @@ PATH_TEXT_PROMPTS = os.environ.get("PATH_TEXT_PROMPTS", "./classes.json")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
 IMAGE_EXT = os.environ.get("IMAGE_EXT", "")
+
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
