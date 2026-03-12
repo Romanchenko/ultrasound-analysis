@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-from typing import List, Optional, Callable, Any
+from typing import List, Optional, Callable, Any, Dict
 from pathlib import Path
 import torchvision.transforms as transforms
 from torchtune.modules.transforms.vision_utils.resize_with_pad import resize_with_pad
