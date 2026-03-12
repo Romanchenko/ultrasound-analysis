@@ -2,10 +2,13 @@
 Shared feature extraction module for quality metrics (FID, MMD, etc.).
 
 Supports multiple pretrained backbones:
-    - 'resnet50'     : torchvision ResNet-50 with ImageNet-1K v2 weights
-    - 'radimagenet'  : ResNet-50 with RadImageNet weights loaded from a
-                       Keras H5 file (converted to PyTorch on the fly)
-    - nn.Module      : any custom model passed directly
+    - 'resnet50'       : torchvision ResNet-50 with ImageNet-1K v2 weights
+    - 'radimagenet'    : ResNet-50 with RadImageNet weights loaded from a
+                         Keras H5 file (converted to PyTorch on the fly)
+    - 'ultrasound_vit' : Custom MAE-pretrained ViT for grayscale ultrasound
+                         images (requires *weights_path* to a training
+                         checkpoint ``.pt`` file)
+    - nn.Module        : any custom model passed directly
 
 RadImageNet weights are expected as a Keras H5 file (.h5).  On first use
 the weights are converted to a PyTorch state dict and cached as a .pt file
@@ -36,14 +39,18 @@ def get_features_model(
 
     Args:
         model_name:
-            * ``'resnet50'``     – ImageNet pretrained ResNet-50.
-            * ``'radimagenet'``  – ResNet-50 with RadImageNet weights.
+            * ``'resnet50'``       – ImageNet pretrained ResNet-50.
+            * ``'radimagenet'``    – ResNet-50 with RadImageNet weights.
               Requires *weights_path* pointing to a Keras ``.h5`` file
               (or a previously converted ``.pt`` file).
-            * An ``nn.Module``   – used as-is (caller is responsible for
+            * ``'ultrasound_vit'`` – Custom MAE-pretrained ViT for
+              grayscale ultrasound.  Requires *weights_path* pointing
+              to a training checkpoint ``.pt`` file.
+            * An ``nn.Module``     – used as-is (caller is responsible for
               removing the classification head).
         device:       Target device.  Auto-detected when *None*.
-        weights_path: Path to weight file.  Required for ``'radimagenet'``.
+        weights_path: Path to weight file.  Required for ``'radimagenet'``
+                      and ``'ultrasound_vit'``.
 
     Returns:
         ``nn.Module`` in eval mode on the requested device.
@@ -69,9 +76,18 @@ def get_features_model(
             )
         return _get_radimagenet(weights_path, device)
 
+    if name == 'ultrasound_vit':
+        if weights_path is None:
+            raise ValueError(
+                "weights_path is required for ultrasound_vit. "
+                "Provide the path to a MAE training checkpoint .pt file."
+            )
+        return _get_ultrasound_vit(weights_path, device)
+
     raise ValueError(
         f"Unknown model_name: '{model_name}'. "
-        f"Supported: 'resnet50', 'radimagenet', or pass an nn.Module directly."
+        f"Supported: 'resnet50', 'radimagenet', 'ultrasound_vit', "
+        f"or pass an nn.Module directly."
     )
 
 
@@ -85,6 +101,76 @@ def _get_resnet50_imagenet(device: torch.device) -> nn.Module:
     model = nn.Sequential(*list(model.children())[:-1])  # drop avgpool+fc → keep up to avgpool
     model.eval()
     return model.to(device)
+
+
+# =====================================================================
+# Ultrasound ViT (MAE-pretrained)
+# =====================================================================
+
+class _ViTFeatureWrapper(nn.Module):
+    """
+    Thin wrapper around :class:`MaskedAutoencoderViT` that implements
+    a standard ``forward(x) → features`` interface expected by the
+    FID / MMD feature-extraction pipeline.
+
+    The wrapper:
+
+    1. Accepts ``[B, C, H, W]`` input (handles both 1-ch and 3-ch by
+       converting to grayscale if needed).
+    2. Resizes to the model's expected ``image_size`` if necessary.
+    3. Returns ``[B, embed_dim, 1, 1]`` so the downstream ``view(B, -1)``
+       flattening produces ``[B, embed_dim]`` — consistent with the
+       ResNet-50 feature extractors.
+    """
+
+    def __init__(self, mae_model):
+        super().__init__()
+        self.mae = mae_model
+        self.image_size = mae_model.image_size
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Handle RGB input (from prepare_image_transform) → grayscale
+        if x.size(1) == 3:
+            # ITU-R BT.601 luminance weights
+            x = 0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3]
+
+        # Resize if needed
+        if x.size(2) != self.image_size or x.size(3) != self.image_size:
+            x = torch.nn.functional.interpolate(
+                x, size=(self.image_size, self.image_size),
+                mode='bilinear', align_corners=False,
+            )
+
+        emb = self.mae.encode(x)          # [B, embed_dim]
+        return emb.unsqueeze(-1).unsqueeze(-1)  # [B, embed_dim, 1, 1]
+
+
+def _get_ultrasound_vit(weights_path: str, device: torch.device) -> nn.Module:
+    """
+    Load a MAE-pretrained ViT from a training checkpoint.
+
+    The checkpoint is expected to contain ``'model_config'`` (architecture
+    hyperparameters) and ``'model_state_dict'``, as produced by
+    :func:`embeddings.vit.train.save_checkpoint`.
+    """
+    from embeddings.vit.model import create_mae_vit
+
+    ckpt = torch.load(weights_path, map_location='cpu')
+
+    if 'model_config' not in ckpt:
+        raise ValueError(
+            f"Checkpoint at '{weights_path}' does not contain 'model_config'. "
+            f"Make sure it was saved with embeddings.vit.train.save_checkpoint()."
+        )
+
+    config = ckpt['model_config']
+    mae_model = create_mae_vit(**config)
+    mae_model.load_state_dict(ckpt['model_state_dict'])
+
+    wrapper = _ViTFeatureWrapper(mae_model)
+    wrapper.eval()
+    return wrapper.to(device)
 
 
 # =====================================================================
