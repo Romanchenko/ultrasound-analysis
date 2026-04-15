@@ -55,6 +55,8 @@ NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
 IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
 SEED = int(os.environ.get("SEED", "42"))
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "run_config.json")
+EVAL_ONLY = os.environ.get("EVAL_ONLY", "").strip().lower() in ("1", "true", "yes")
+PATH_HEAD_CHECKPOINT = os.environ.get("PATH_HEAD_CHECKPOINT", "best_head.pt")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -507,14 +509,47 @@ def main():
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=True, drop_last=True,
+        num_workers=NUM_WORKERS, pin_memory=False, drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=True,
+        num_workers=NUM_WORKERS, pin_memory=False,
     )
 
-    # --- Model ---
+    # --- Load or create head ---
+    head_ckpt_path = PATH_HEAD_CHECKPOINT
+    criterion = nn.CrossEntropyLoss()
+
+    if EVAL_ONLY:
+        # ---- Evaluation-only mode ----
+        print(f"\n*** EVAL_ONLY mode – loading head from {head_ckpt_path} ***")
+        head_ckpt = torch.load(head_ckpt_path, map_location=device, weights_only=False)
+        saved_config = head_ckpt.get("train_config", {})
+
+        head_hid = saved_config.get("head_hidden_dim", HEAD_HIDDEN_DIM)
+        head_drop = saved_config.get("head_dropout", HEAD_DROPOUT)
+        head = MLPHead(embed_dim, num_classes, head_hid, head_drop)
+        model = MAEClassifier(encoder, head).to(device)
+        model.head.load_state_dict(head_ckpt["head_state_dict"])
+
+        print(f"Head loaded (trained epoch {head_ckpt.get('epoch', '?')}, "
+              f"val_bal_acc={100*head_ckpt.get('val_bal_acc', 0):.2f}%)")
+
+        val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, device)
+
+        val_paths: List[str] = []
+        for idx in val_ds.indices:
+            val_paths.append(ds.data[idx]["img"])
+
+        print("\n" + "=" * 60)
+        print("EVALUATION RESULTS")
+        print("=" * 60)
+
+        metrics = compute_and_print_metrics(y_true, y_pred, ds.class_names, num_classes)
+        save_results(metrics, y_true, y_pred, val_paths, ds.class_names)
+        return
+
+    # ---- Training mode ----
     head = MLPHead(embed_dim, num_classes, HEAD_HIDDEN_DIM, HEAD_DROPOUT)
     model = MAEClassifier(encoder, head).to(device)
 
@@ -523,7 +558,6 @@ def main():
     print(f"Parameters: {n_trainable:,} trainable | {n_frozen:,} frozen")
 
     optimizer = optim.AdamW(model.head.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    criterion = nn.CrossEntropyLoss()
 
     # --- Build reproducibility config ---
     train_config = build_train_config(
@@ -563,7 +597,7 @@ def main():
                 "epoch": epoch,
                 "val_bal_acc": val_bal_acc,
                 "train_config": train_config,
-            }, "best_head.pt")
+            }, head_ckpt_path)
 
         print(
             f"Epoch {epoch:3d}/{EPOCHS} | "
@@ -576,7 +610,7 @@ def main():
     print(f"\nBest validation balanced accuracy: {100*best_val_bal_acc:.2f}% at epoch {best_epoch}")
 
     # --- Final evaluation with best head ---
-    best_ckpt = torch.load("best_head.pt", map_location=device)
+    best_ckpt = torch.load(head_ckpt_path, map_location=device, weights_only=False)
     model.head.load_state_dict(best_ckpt["head_state_dict"])
     val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, device)
 
