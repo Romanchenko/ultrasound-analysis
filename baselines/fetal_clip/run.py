@@ -79,7 +79,7 @@ class DatasetProcessed(torch.utils.data.Dataset):
         self.data = []
         for _, row in df.iterrows():
             self.data.append({
-                'img': os.path.join(self.root, f"{row['image']}{self.image_ext}"),
+                'img': os.path.join(self.root, f"{row['image']}{self.image_ext}.npy"),
                 'class_name': row['class'],
                 'class_idx': int(row['class_idx']),
             })
@@ -88,13 +88,24 @@ class DatasetProcessed(torch.utils.data.Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-        img = load_dicom_as_pil(self.data[index]['img'])
+        img = load_npy_as_pil(self.data[index]['img'])
         img = make_image_square_with_zero_padding(img)
         img = self.preprocess(img)
         class_idx = self.data[index]['class_idx']
 
         return img, class_idx, self.data[index]['img']
 
+def load_npy_as_pil(path):
+    """Read a .npy file and return an RGB PIL Image with uint8 normalization."""
+
+    npy = np.load(path)
+
+    # Ensure array is uint8 in [0, 255]
+    if npy.dtype != np.uint8:
+        npy = np.clip(npy, 0, 255).astype(np.uint8)
+
+    img = Image.fromarray(npy, mode="RGB")
+    return img
 
 def load_dicom_as_pil(path):
     """Read a DICOM file and return an RGB PIL Image."""

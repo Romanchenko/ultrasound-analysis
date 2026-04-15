@@ -11,7 +11,18 @@ from PIL import Image
 from typing import List, Optional, Callable, Any, Dict
 from pathlib import Path
 import torchvision.transforms as transforms
-from torchtune.modules.transforms.vision_utils.resize_with_pad import resize_with_pad
+
+from embeddings.vit.train import resize_keep_aspect_pad
+
+
+def composite_plane_label(plane: str, brain_plane: str) -> str:
+    """
+    Canonical string label for the pair (Plane, Brain_plane).
+
+    Used as the classification key when ``class_to_idx`` is set and for
+    ``get_class_counts`` with ``label_key='composite'``.
+    """
+    return f"{plane}::{brain_plane}"
 
 
 class FetalPlanesDBDataset(Dataset):
@@ -26,13 +37,14 @@ class FetalPlanesDBDataset(Dataset):
     
     Args:
         root: Root directory of the dataset
-        transform: List of transformation functions to apply (default: resize_with_pad)
-        target_size: Target size for resize_with_pad (default: (224, 224))
+        transform: List of transformation functions to apply (default: resize_keep_aspect_pad)
+        target_size: Target size for resize (default: (224, 224), assumes square)
         csv_file: Name of the CSV file (default: 'FETAL_PLANES_DB_data.csv')
         images_dir: Name of images directory (default: 'images')
         train: If True, load training set; if False, load validation set; if None, load all (default: None)
-        class_to_idx: Optional mapping from Brain_plane class names to indices for classification.
-                      If provided, __getitem__ will return 'label_idx' instead of 'label' dict.
+        class_to_idx: Optional mapping from composite labels ``(Plane, Brain_plane)`` to indices
+                      (see :func:`composite_plane_label`). If provided, ``__getitem__`` returns
+                      ``label_idx`` and ``label_name`` is the composite string.
     """
     
     def __init__(
@@ -61,7 +73,7 @@ class FetalPlanesDBDataset(Dataset):
         
         # Filter by train/val split if specified
         if train is not None:
-            self.df = self.df[self.df['Train'] == (1 if train else 0)]
+            self.df = self.df[self.df['Train '] == (1 if train else 0)]
         
         # Reset index after filtering
         self.df = self.df.reset_index(drop=True)
@@ -74,17 +86,20 @@ class FetalPlanesDBDataset(Dataset):
             image_path = self.images_dir / f"{image_name}.png"
             
             if image_path.exists():
-                brain_plane = row.get('Brain_plane', '')
-                
-                # If class_to_idx is provided, filter out unknown classes
-                if class_to_idx is not None and brain_plane not in class_to_idx:
+                plane = str(row.get('Plane', '') or '')
+                brain_plane = str(row.get('Brain_plane', '') or '')
+                comp = composite_plane_label(plane, brain_plane)
+
+                # If class_to_idx is provided, filter out unknown composite classes
+                if class_to_idx is not None and comp not in class_to_idx:
                     continue
-                
+
                 self.image_paths.append(image_path)
-                # Store relevant metadata
+                # Store relevant metadata (composite = (Plane, Brain_plane) as one label)
                 self.labels.append({
                     'Brain_plane': brain_plane,
-                    'Plane': row.get('Plane', ''),
+                    'Plane': plane,
+                    'composite': comp,
                     'Patient_num': row.get('Patient_num', ''),
                     'Image_name': image_name
                 })
@@ -98,33 +113,26 @@ class FetalPlanesDBDataset(Dataset):
         
         # Set up transforms
         if transform is None:
-            # Default: resize_with_pad with zero padding
+            # Default: resize_keep_aspect_pad (aspect ratio preserved, zero padding)
             self.transform = self._get_default_transforms()
         else:
             self.transform = transforms.Compose(transform) if transform else None
     
     def _get_default_transforms(self) -> transforms.Compose:
         """
-        Get default transforms including resize_with_pad with zero padding.
-        
-        Returns:
-            Compose transform with resize_with_pad
+        Get default transforms: resize with aspect ratio preserved and zero padding.
+
+        Uses resize_keep_aspect_pad to fit within target_size while keeping proportions.
         """
-        
-        # Create resize_with_pad transform with zero padding
-        # resize_with_pad typically takes target_size as (height, width) tuple
-        def resize_pad_transform(img):
-            """Apply resize_with_pad with zero (black) padding."""
-            # resize_with_pad expects PIL Image and returns PIL Image
-            # padding_value=0 means black padding
-            # target_size should be (height, width)
-            return resize_with_pad(
+        size = self.target_size[0]  # assumes square (H, W) e.g. (224, 224)
+
+        def resize_pad_transform(img: torch.Tensor) -> torch.Tensor:
+            return resize_keep_aspect_pad(
                 img,
-                target_size=self.target_size,  # (H, W)
-                resample=transforms.InterpolationMode.BILINEAR,
-                # padding_value=0  # Black padding (zero values)
+                size=size,
+                interpolation=transforms.InterpolationMode.BILINEAR,
             )
-        
+
         return transforms.Compose([
             transforms.ToTensor(),  # Convert to tensor [1, H, W] for grayscale
             transforms.Lambda(resize_pad_transform),
@@ -143,8 +151,9 @@ class FetalPlanesDBDataset(Dataset):
         Returns:
             Dictionary with:
                 - 'image': Image tensor [1, H, W] (grayscale)
-                - 'label': Dictionary with metadata (Brain_plane, Plane, Patient_num, Image_name)
-                           OR 'label_idx': Integer label index (if class_to_idx is provided)
+                - 'label': Dictionary with metadata (Brain_plane, Plane, composite, …)
+                           OR ``label_idx`` / ``label_name`` if ``class_to_idx`` is provided
+                              (``label_name`` is the composite ``Plane::Brain_plane`` string).
         """
         image_path = self.image_paths[idx]
         label = self.labels[idx]
@@ -173,13 +182,13 @@ class FetalPlanesDBDataset(Dataset):
         
         # Return format depends on whether class_to_idx is provided
         if self.class_to_idx is not None:
-            # Classification mode: return label_idx
-            brain_plane = label['Brain_plane']
-            label_idx = self.class_to_idx[brain_plane]
+            # Classification mode: (Plane, Brain_plane) composite label
+            comp = label['composite']
+            label_idx = self.class_to_idx[comp]
             return {
                 'image': image,
                 'label_idx': torch.tensor(label_idx, dtype=torch.long),
-                'label_name': brain_plane
+                'label_name': comp,
             }
         else:
             # Default mode: return full label dict
@@ -188,15 +197,14 @@ class FetalPlanesDBDataset(Dataset):
                 'label': label
             }
     
-    def get_class_counts(self, label_key: str = 'Brain_plane') -> dict:
+    def get_class_counts(self, label_key: str = 'composite') -> dict:
         """
         Get counts of each class for a given label key.
-        
+
         Args:
-            label_key: Key in label dictionary to count (default: 'Brain_plane')
-            
-        Returns:
-            Dictionary mapping class names to counts
+            label_key: Key in label dictionary to count. Default ``'composite'`` for
+                       the ``(Plane, Brain_plane)`` pair; use ``'Brain_plane'`` or
+                       ``'Plane'`` for marginal counts only.
         """
         counts = {}
         for label in self.labels:

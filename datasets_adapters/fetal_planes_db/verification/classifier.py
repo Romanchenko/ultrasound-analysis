@@ -231,29 +231,18 @@ class BrainPlaneClassifierTrainer:
 
 def get_class_mapping(dataset: FetalPlanesDBDataset) -> Dict[str, int]:
     """
-    Get mapping from Brain_plane class names to indices.
+    Get mapping from (Plane, Brain_plane) composite label strings to indices.
     Uses the dataset's labels directly for efficiency.
-    
-    Args:
-        dataset: FetalPlanesDBDataset instance
-        
-    Returns:
-        Dictionary mapping class names to indices
     """
-    # Collect all unique Brain_plane values from dataset labels
-    brain_planes = [label.get('Brain_plane', '') for label in dataset.labels]
-    
-    # Get unique classes and sort for consistency
-    unique_classes = sorted(set(brain_planes))
-    
-    # Create mapping
+    composites = [label["composite"] for label in dataset.labels]
+    unique_classes = sorted(set(composites))
     class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
-    
-    print(f"Found {len(unique_classes)} Brain_plane classes:")
+
+    print(f"Found {len(unique_classes)} (Plane, Brain_plane) classes:")
     for cls, idx in class_to_idx.items():
-        count = brain_planes.count(cls)
+        count = composites.count(cls)
         print(f"  {cls}: {idx} ({count} samples)")
-    
+
     return class_to_idx
 
 

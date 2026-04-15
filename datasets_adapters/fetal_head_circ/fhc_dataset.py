@@ -123,32 +123,19 @@ class FetalHeadCircDataset(Dataset):
     
     def _get_default_transforms(self) -> transforms.Compose:
         """
-        Get default transforms including resize_with_pad with zero padding.
-        
-        Returns:
-            Compose transform with resize_with_pad
+        Get default transforms: resize with aspect ratio preserved and zero padding.
         """
-        try:
-            from torchtune.modules.transforms.vision_utils.resize_with_pad import resize_with_pad
-        except ImportError:
-            raise ImportError(
-                "torchtune is required for resize_with_pad. "
-                "Install it with: pip install torchtune"
-            )
-        
-        # Create resize_with_pad transform with zero padding
-        def resize_pad_transform(img):
-            """Apply resize_with_pad with zero (black) padding."""
-            # resize_with_pad expects PIL Image and returns PIL Image
-            # padding_value=0 means black padding
-            # target_size should be (height, width)
-            return resize_with_pad(
+        from embeddings.vit.train import resize_keep_aspect_pad
+
+        size = self.target_size[0]  # assumes square (H, W) e.g. (224, 224)
+
+        def resize_pad_transform(img: torch.Tensor) -> torch.Tensor:
+            return resize_keep_aspect_pad(
                 img,
-                target_size=self.target_size,  # (H, W)
-                resample=transforms.InterpolationMode.BILINEAR,
-                # padding_value=0  # Black padding (zero values)
+                size=size,
+                interpolation=transforms.InterpolationMode.BILINEAR,
             )
-        
+
         return transforms.Compose([
             transforms.ToTensor(),  # Convert to tensor [1, H, W] for grayscale
             transforms.Lambda(resize_pad_transform),

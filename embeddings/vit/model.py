@@ -20,7 +20,7 @@ References
 
 import math
 from functools import partial
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -75,6 +75,7 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
+        # print(f"Attention x shape. B: {B}, N: {N}, C: {C}")
         qkv = (
             self.qkv(x)
             .reshape(B, N, 3, self.num_heads, self.head_dim)
@@ -103,6 +104,33 @@ class MLP(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
+def _make_decoder_pred_head(
+    decoder_embed_dim: int,
+    patch_pixels: int,
+    num_layers: int,
+    hidden_dim: int,
+) -> nn.Module:
+    """
+    Map decoder token features to per-patch pixel logits.
+
+    * ``num_layers == 1``: single linear (original MAE head).
+    * ``num_layers >= 2``: stack of ``num_layers`` linear layers with GELU between them
+      (last layer has no activation).
+    """
+    if num_layers < 1:
+        raise ValueError(f"decoder_pred_num_layers must be >= 1, got {num_layers}")
+    if num_layers == 1:
+        return nn.Linear(decoder_embed_dim, patch_pixels, bias=True)
+    layers: List[nn.Module] = []
+    d_in = decoder_embed_dim
+    for _ in range(num_layers - 1):
+        layers.append(nn.Linear(d_in, hidden_dim))
+        layers.append(nn.GELU())
+        d_in = hidden_dim
+    layers.append(nn.Linear(d_in, patch_pixels))
+    return nn.Sequential(*layers)
+
+
 class TransformerBlock(nn.Module):
     """Pre-norm Transformer block (LayerNorm → Attention / MLP)."""
 
@@ -129,6 +157,30 @@ class TransformerBlock(nn.Module):
 # Masked Autoencoder ViT
 # =====================================================================
 
+def _pixel_pad_mask_to_patch(
+    pad_mask: torch.Tensor,
+    patch_size: int,
+    threshold: float = 0.5,
+) -> torch.Tensor:
+    """Convert a pixel-level padding mask to a patch-level boolean mask.
+
+    Args:
+        pad_mask: ``[B, 1, H, W]`` boolean (True = padding pixel).
+        patch_size: Side length of each patch.
+        threshold: A patch is considered "pad" if more than this fraction
+            of its pixels are padding.
+
+    Returns:
+        ``[B, N]`` boolean, True where the patch is a padding patch.
+    """
+    B, _, H, W = pad_mask.shape
+    h, w = H // patch_size, W // patch_size
+    # Reshape to [B, h, patch_size, w, patch_size] then compute fraction
+    pm = pad_mask[:, 0].reshape(B, h, patch_size, w, patch_size)
+    frac = pm.float().mean(dim=(2, 4))  # [B, h, w]
+    return (frac > threshold).reshape(B, h * w)  # [B, N]
+
+
 class MaskedAutoencoderViT(nn.Module):
     """
     Vision Transformer with a Masked Autoencoder (MAE) head for
@@ -153,7 +205,19 @@ class MaskedAutoencoderViT(nn.Module):
         decoder_num_heads: Number of attention heads in the decoder.
         mlp_ratio:         MLP hidden-dim / embed-dim ratio.
         norm_pix_loss:     If True, normalise each patch to zero-mean
-                           unit-variance before computing MSE loss.
+                           unit-variance before computing reconstruction loss.
+        clip_pixel_pred:   If True, pass decoder logits through :func:`torch.sigmoid` so
+                           pixel predictions lie in ``(0, 1)``, matching ``ToTensor()`` range
+                           without hard clipping (smooth gradients; avoids zero grads from
+                           :func:`torch.clamp` outside the box).
+        decoder_pred_num_layers: Linear layers in the pixel head after decoder blocks
+            (1 = single linear, MAE paper default; 2+ = MLP with GELU between layers).
+        decoder_pred_hidden_dim: Hidden width for intermediate layers when
+            ``decoder_pred_num_layers > 1``. Defaults to ``decoder_embed_dim``.
+        l1_loss_weight:  Non-negative weight on mean **absolute** error per patch (L1 component).
+        l2_loss_weight:  Non-negative weight on mean **squared** error per patch (L2 component).
+            Combined patch loss is ``l1_loss_weight * L1_patch + l2_loss_weight * L2_patch``,
+            then averaged over masked patches. Default ``(0, 1)`` recovers pure MSE.
     """
 
     def __init__(
@@ -169,8 +233,30 @@ class MaskedAutoencoderViT(nn.Module):
         decoder_num_heads: int = 3,
         mlp_ratio: float = 4.0,
         norm_pix_loss: bool = True,
+        clip_pixel_pred: bool = True,
+        decoder_pred_num_layers: int = 1,
+        decoder_pred_hidden_dim: Optional[int] = None,
+        l1_loss_weight: float = 0.0,
+        l2_loss_weight: float = 1.0,
     ):
         super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads}). "
+                f"Multi-head attention requires head_dim = embed_dim // num_heads to be integer."
+            )
+        if decoder_embed_dim % decoder_num_heads != 0:
+            raise ValueError(
+                f"decoder_embed_dim ({decoder_embed_dim}) must be divisible by "
+                f"decoder_num_heads ({decoder_num_heads})."
+            )
+        if l1_loss_weight < 0 or l2_loss_weight < 0:
+            raise ValueError(
+                f"l1_loss_weight and l2_loss_weight must be non-negative, "
+                f"got l1_loss_weight={l1_loss_weight}, l2_loss_weight={l2_loss_weight}."
+            )
+        if l1_loss_weight == 0.0 and l2_loss_weight == 0.0:
+            raise ValueError("At least one of l1_loss_weight or l2_loss_weight must be positive.")
 
         # ---- store config for serialisation / feature_extractor ----
         self.image_size = image_size
@@ -184,6 +270,16 @@ class MaskedAutoencoderViT(nn.Module):
         self.decoder_num_heads = decoder_num_heads
         self.mlp_ratio = mlp_ratio
         self.norm_pix_loss = norm_pix_loss
+        self.clip_pixel_pred = clip_pixel_pred
+        self.decoder_pred_num_layers = decoder_pred_num_layers
+        pred_hid = (
+            decoder_pred_hidden_dim
+            if decoder_pred_hidden_dim is not None
+            else decoder_embed_dim
+        )
+        self.decoder_pred_hidden_dim = pred_hid
+        self.l1_loss_weight = l1_loss_weight
+        self.l2_loss_weight = l2_loss_weight
 
         # ---- encoder ----
         self.patch_embed = PatchEmbed(image_size, patch_size, in_channels, embed_dim)
@@ -217,9 +313,12 @@ class MaskedAutoencoderViT(nn.Module):
             for _ in range(decoder_depth)
         ])
         self.decoder_norm = nn.LayerNorm(decoder_embed_dim)
-        # Predict pixel values for each patch
-        self.decoder_pred = nn.Linear(
-            decoder_embed_dim, patch_size ** 2 * in_channels, bias=True
+        patch_pixels = patch_size ** 2 * in_channels
+        self.decoder_pred = _make_decoder_pred_head(
+            decoder_embed_dim,
+            patch_pixels,
+            decoder_pred_num_layers,
+            pred_hid,
         )
 
         self._init_weights()
@@ -301,34 +400,48 @@ class MaskedAutoencoderViT(nn.Module):
     # -----------------------------------------------------------------
 
     def random_masking(
-        self, x: torch.Tensor, mask_ratio: float = 0.75,
+        self,
+        x: torch.Tensor,
+        mask_ratio: float = 0.75,
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Per-sample random masking by shuffling patch indices.
 
         Args:
-            x: [B, N, D]  (patch embeddings, no CLS)
-            mask_ratio: fraction of patches to mask
+            x: ``[B, N, D]``  (patch embeddings, no CLS)
+            mask_ratio: fraction of **content** patches to mask.
+            pad_mask: ``[B, N]`` boolean, True = padding patch.  Padding
+                patches are always forced into the masked (removed) set
+                and ``num_keep`` is computed relative to content patches
+                only.
 
         Returns:
-            x_masked: [B, N_visible, D]
-            mask:     [B, N]  binary, 1 = masked (removed), 0 = kept
-            ids_restore: [B, N]  indices to unshuffle
+            x_masked: ``[B, num_keep, D]``
+            mask:     ``[B, N]``  binary, 1 = masked (removed), 0 = kept
+            ids_restore: ``[B, N]``  indices to unshuffle
         """
         B, N, D = x.shape
-        num_keep = int(N * (1 - mask_ratio))
 
-        noise = torch.rand(B, N, device=x.device)       # [B, N]
-        ids_shuffle = noise.argsort(dim=1)                # ascend: small kept
+        noise = torch.rand(B, N, device=x.device)
+
+        if pad_mask is not None:
+            # Force padding patches to sort last (always masked)
+            noise = noise.masked_fill(pad_mask, float('inf'))
+            n_content = (~pad_mask).float().sum(dim=1)  # [B]
+            num_keep = (n_content * (1 - mask_ratio)).int().min().item()
+            num_keep = max(num_keep, 1)
+        else:
+            num_keep = int(N * (1 - mask_ratio))
+
+        ids_shuffle = noise.argsort(dim=1)
         ids_restore = ids_shuffle.argsort(dim=1)
 
-        # Keep first num_keep tokens
-        ids_keep = ids_shuffle[:, :num_keep]              # [B, num_keep]
+        ids_keep = ids_shuffle[:, :num_keep]
         x_masked = torch.gather(
             x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D)
         )
 
-        # Binary mask: 0 = kept, 1 = removed
         mask = torch.ones(B, N, device=x.device)
         mask[:, :num_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
@@ -340,34 +453,45 @@ class MaskedAutoencoderViT(nn.Module):
     # -----------------------------------------------------------------
 
     def forward_encoder(
-        self, x: torch.Tensor, mask_ratio: float = 0.75,
+        self,
+        x: torch.Tensor,
+        mask_ratio: float = 0.75,
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Encode only the *visible* patches (training path).
 
         Args:
-            x: [B, C, H, W]
+            x: ``[B, C, H, W]``
+            pad_mask: ``[B, 1, H, W]`` boolean pixel-level mask (True = pad),
+                or ``None``.
 
         Returns:
-            latent:      [B, N_visible + 1, embed_dim]  (includes CLS)
-            mask:        [B, N]
-            ids_restore: [B, N]
+            latent:      ``[B, N_visible + 1, embed_dim]``  (includes CLS)
+            mask:        ``[B, N]``
+            ids_restore: ``[B, N]``
         """
-        # Patch embed
-        x = self.patch_embed(x)                          # [B, N, D]
+        patch_pad_mask: Optional[torch.Tensor] = None
+        if pad_mask is not None:
+            patch_pad_mask = _pixel_pad_mask_to_patch(
+                pad_mask, self.patch_size,
+            )
 
-        # Add positional embed (skip CLS slot at index 0)
+        x = self.patch_embed(x)                          # [B, N, D]
         x = x + self.pos_embed[:, 1:, :]
 
-        # Mask
-        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+        # Zero-out padding patch embeddings before masking
+        if patch_pad_mask is not None:
+            x = x * (~patch_pad_mask).unsqueeze(-1).float()
 
-        # Prepend CLS token
+        x, mask, ids_restore = self.random_masking(
+            x, mask_ratio, pad_mask=patch_pad_mask,
+        )
+
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)            # [B, 1+N_vis, D]
+        x = torch.cat([cls_tokens, x], dim=1)
 
-        # Transformer blocks
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
@@ -391,7 +515,8 @@ class MaskedAutoencoderViT(nn.Module):
             ids_restore: [B, N]
 
         Returns:
-            pred: [B, N, patch_size**2 * in_channels]
+            pred: [B, N, patch_size**2 * in_channels]. If ``clip_pixel_pred``, values are
+                  in ``(0, 1)`` via sigmoid (logits from the pixel prediction head).
         """
         # Project to decoder dim
         x = self.decoder_embed(x)                       # [B, 1+N_vis, dec_dim]
@@ -420,8 +545,10 @@ class MaskedAutoencoderViT(nn.Module):
             x = blk(x)
         x = self.decoder_norm(x)
 
-        # Predict pixel values (skip CLS)
+        # Pixel logits → (0, 1) via sigmoid (smooth, same range as ToTensor inputs)
         x = self.decoder_pred(x[:, 1:, :])               # [B, N, p*p*C]
+        if self.clip_pixel_pred:
+            x = torch.sigmoid(x)
 
         return x
 
@@ -434,14 +561,17 @@ class MaskedAutoencoderViT(nn.Module):
         imgs: torch.Tensor,
         pred: torch.Tensor,
         mask: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        MSE loss on masked patches only.
+        Weighted L1 + L2 reconstruction loss on masked **content** patches.
 
         Args:
-            imgs: [B, C, H, W]
-            pred: [B, N, p*p*C]
-            mask: [B, N]  (1 = masked)
+            imgs: ``[B, C, H, W]``
+            pred: ``[B, N, p*p*C]``
+            mask: ``[B, N]``  (1 = masked)
+            pad_mask: ``[B, 1, H, W]`` boolean pixel mask (True = pad),
+                or ``None``.
 
         Returns:
             Scalar loss.
@@ -453,11 +583,18 @@ class MaskedAutoencoderViT(nn.Module):
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1e-6).sqrt()
 
-        loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)                          # [B, N]
+        diff = pred - target
+        l1 = diff.abs().mean(dim=-1)                      # [B, N]
+        l2 = (diff ** 2).mean(dim=-1)                     # [B, N]
+        loss = self.l1_loss_weight * l1 + self.l2_loss_weight * l2
 
-        # Average over masked patches only
-        loss = (loss * mask).sum() / mask.sum()
+        effective_mask = mask
+        if pad_mask is not None:
+            patch_pad = _pixel_pad_mask_to_patch(pad_mask, self.patch_size)
+            effective_mask = mask * (~patch_pad).float()
+
+        denom = effective_mask.sum().clamp_min(1.0)
+        loss = (loss * effective_mask).sum() / denom
         return loss
 
     # -----------------------------------------------------------------
@@ -468,21 +605,25 @@ class MaskedAutoencoderViT(nn.Module):
         self,
         imgs: torch.Tensor,
         mask_ratio: float = 0.75,
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Full MAE forward pass (training).
 
         Args:
-            imgs: [B, C, H, W]
+            imgs: ``[B, C, H, W]``
+            pad_mask: ``[B, 1, H, W]`` boolean (True = pad), or ``None``.
 
         Returns:
             loss:  scalar reconstruction loss
-            pred:  [B, N, p*p*C]
-            mask:  [B, N]
+            pred:  ``[B, N, p*p*C]``
+            mask:  ``[B, N]``
         """
-        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
+        latent, mask, ids_restore = self.forward_encoder(
+            imgs, mask_ratio, pad_mask=pad_mask,
+        )
         pred = self.forward_decoder(latent, ids_restore)
-        loss = self.forward_loss(imgs, pred, mask)
+        loss = self.forward_loss(imgs, pred, mask, pad_mask=pad_mask)
         return loss, pred, mask
 
     # -----------------------------------------------------------------
@@ -490,19 +631,28 @@ class MaskedAutoencoderViT(nn.Module):
     # -----------------------------------------------------------------
 
     @torch.no_grad()
-    def encode(self, imgs: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self,
+        imgs: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Extract CLS-token embeddings by feeding *all* patches through
         the encoder (no masking).
 
         Args:
-            imgs: [B, C, H, W]
+            imgs: ``[B, C, H, W]``
+            pad_mask: ``[B, 1, H, W]`` boolean (True = pad), or ``None``.
 
         Returns:
-            [B, embed_dim]
+            ``[B, embed_dim]``
         """
         x = self.patch_embed(imgs)                       # [B, N, D]
         x = x + self.pos_embed[:, 1:, :]
+
+        if pad_mask is not None:
+            patch_pad = _pixel_pad_mask_to_patch(pad_mask, self.patch_size)
+            x = x * (~patch_pad).unsqueeze(-1).float()
 
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
@@ -599,6 +749,11 @@ def create_mae_vit(
     decoder_num_heads: int = 3,
     mlp_ratio: float = 4.0,
     norm_pix_loss: bool = True,
+    clip_pixel_pred: bool = True,
+    decoder_pred_num_layers: int = 1,
+    decoder_pred_hidden_dim: Optional[int] = None,
+    l1_loss_weight: float = 0.0,
+    l2_loss_weight: float = 1.0,
 ) -> MaskedAutoencoderViT:
     """
     Create a Masked Autoencoder ViT with sensible defaults for
@@ -619,5 +774,10 @@ def create_mae_vit(
         decoder_num_heads=decoder_num_heads,
         mlp_ratio=mlp_ratio,
         norm_pix_loss=norm_pix_loss,
+        clip_pixel_pred=clip_pixel_pred,
+        decoder_pred_num_layers=decoder_pred_num_layers,
+        decoder_pred_hidden_dim=decoder_pred_hidden_dim,
+        l1_loss_weight=l1_loss_weight,
+        l2_loss_weight=l2_loss_weight,
     )
 

@@ -29,3 +29,17 @@ filename,pixel size,head circumference (mm)
 2_HC.png,0.0896585200514,56.81
 3_HC.png,0.062032562715,68.75
 ```
+
+```
+    <link rel="alternate" type="text/csv" href="https://zenodo.org/records/1322001/files/test_set_pixel_size.csv">
+    <link rel="item" type="text/csv" href="https://zenodo.org/records/1322001/files/test_set_pixel_size.csv">
+    
+    <link rel="alternate" type="text/csv" href="https://zenodo.org/records/1322001/files/training_set_pixel_size_and_HC.csv">
+    <link rel="item" type="text/csv" href="https://zenodo.org/records/1322001/files/training_set_pixel_size_and_HC.csv">
+    
+    <link rel="alternate" type="application/zip" href="https://zenodo.org/records/1322001/files/test_set.zip">
+    <link rel="item" type="application/zip" href="https://zenodo.org/records/1322001/files/test_set.zip">
+    
+    <link rel="alternate" type="application/zip" href="https://zenodo.org/records/1322001/files/training_set.zip">
+    <link rel="item" type="application/zip" href="https://zenodo.org/records/1322001/files/training_set.zip">
+```

@@ -163,6 +163,13 @@ class TestFetalPlanesDBDataset(unittest.TestCase):
         # Both images have 'Other' as Plane
         self.assertIn('Other', counts)
         self.assertEqual(counts['Other'], 2)
+
+    def test_get_class_counts_composite_default(self):
+        """Default get_class_counts uses (Plane, Brain_plane) composite."""
+        dataset = FetalPlanesDBDataset(root=self.test_root)
+        counts = dataset.get_class_counts()
+        self.assertEqual(counts['Other::Not A Brain'], 1)
+        self.assertEqual(counts['Other::Some'], 1)
     
     def test_dataset_length(self):
         """Test dataset __len__ method."""
@@ -252,6 +259,7 @@ class TestFetalPlanesDBDataset(unittest.TestCase):
         self.assertIsNotNone(sample_a)
         self.assertEqual(sample_a['label']['Brain_plane'], 'Not A Brain')
         self.assertEqual(sample_a['label']['Plane'], 'Other')
+        self.assertEqual(sample_a['label']['composite'], 'Other::Not A Brain')
         self.assertEqual(sample_a['label']['Patient_num'], 1)
         self.assertEqual(sample_a['label']['Image_name'], 'A')
     
