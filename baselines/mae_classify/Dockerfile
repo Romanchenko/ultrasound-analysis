@@ -59,6 +59,8 @@ ENV SEED="42"
 ENV EVAL_ONLY="0"
 ENV PATH_HEAD_CHECKPOINT="best_head.pt"
 ENV CONFIG_PATH="run_config.json"
+ENV MODE="train"
+ENV DEVICE=""
 
 WORKDIR /app/results
 

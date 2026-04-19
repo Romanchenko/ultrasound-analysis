@@ -55,10 +55,16 @@ NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
 IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
 SEED = int(os.environ.get("SEED", "42"))
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "run_config.json")
-EVAL_ONLY = os.environ.get("EVAL_ONLY", "").strip().lower() in ("1", "true", "yes")
 PATH_HEAD_CHECKPOINT = os.environ.get("PATH_HEAD_CHECKPOINT", "best_head.pt")
+_mode_raw = os.environ.get("MODE", "train").strip().lower()
+_eval_flag = os.environ.get("EVAL_ONLY", "").strip().lower() in ("1", "true", "yes")
+MODE = "eval" if _eval_flag else _mode_raw
+DEVICE = os.environ.get("DEVICE", "").strip()
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE:
+    device = torch.device(DEVICE)
+else:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _parse_exclude_ids(raw: str) -> Set[int]:
@@ -462,22 +468,65 @@ def save_results(
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _save_head_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    val_bal_acc,
+    train_config,
+    history,
+    path,
+):
+    """Save head weights, optimizer state, and config for resume/eval."""
+    torch.save({
+        "head_state_dict": model.head.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+        "val_bal_acc": val_bal_acc,
+        "train_config": train_config,
+        "history": history,
+    }, path)
+
+
+def _load_head_checkpoint(path, model, optimizer=None):
+    """Load head checkpoint; optionally restore optimizer state."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.head.load_state_dict(ckpt["head_state_dict"])
+    if optimizer is not None and "optimizer_state_dict" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    return ckpt
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def _final_evaluate(model, val_loader, val_ds, ds, criterion):
+    """Run evaluation on the val set, print metrics, and save result files."""
+    val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, device)
+    val_paths = [ds.data[idx]["img"] for idx in val_ds.indices]
+    metrics = compute_and_print_metrics(y_true, y_pred, ds.class_names, ds.num_classes)
+    save_results(metrics, y_true, y_pred, val_paths, ds.class_names)
+    return metrics
+
 
 def main():
     import sys
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Local repo layout: baselines/mae_classify/run.py -> repo root is ../../
     sys.path.insert(0, os.path.join(script_dir, "..", ".."))
-    # Docker layout: /app/run.py with /app/embeddings/vit/ alongside it
     sys.path.insert(0, script_dir)
     from embeddings.vit.train import load_checkpoint
 
     if not PATH_MAE_CHECKPOINT:
         raise RuntimeError("PATH_MAE_CHECKPOINT environment variable must be set")
+    if MODE not in ("train", "resume", "eval"):
+        raise RuntimeError(f"MODE must be train, resume, or eval -- got: {MODE}")
 
     print(f"Device: {device}")
+    print(f"Mode:   {MODE}")
     print(f"Checkpoint: {PATH_MAE_CHECKPOINT}")
     print(f"Images dir: {DIR_IMAGES}")
     print(f"CSV: {PATH_CSV}")
@@ -485,12 +534,10 @@ def main():
     exclude_ids = _parse_exclude_ids(EXCLUDE_CLASS_IDS)
     print(f"Excluding class_idx: {exclude_ids}")
 
-    # --- Load encoder ---
     encoder, ckpt_info = load_checkpoint(PATH_MAE_CHECKPOINT, device=device)
     embed_dim = encoder.embed_dim
     print(f"Encoder embed_dim={embed_dim}, loaded from epoch {ckpt_info.get('epoch', '?')}")
 
-    # --- Dataset ---
     ds = ClassificationDataset(
         dir_images=DIR_IMAGES,
         path_csv=PATH_CSV,
@@ -516,62 +563,76 @@ def main():
         num_workers=NUM_WORKERS, pin_memory=False,
     )
 
-    # --- Load or create head ---
-    head_ckpt_path = PATH_HEAD_CHECKPOINT
     criterion = nn.CrossEntropyLoss()
 
-    if EVAL_ONLY:
-        # ---- Evaluation-only mode ----
-        print(f"\n*** EVAL_ONLY mode – loading head from {head_ckpt_path} ***")
-        head_ckpt = torch.load(head_ckpt_path, map_location=device, weights_only=False)
-        saved_config = head_ckpt.get("train_config", {})
-
-        head_hid = saved_config.get("head_hidden_dim", HEAD_HIDDEN_DIM)
-        head_drop = saved_config.get("head_dropout", HEAD_DROPOUT)
-        head = MLPHead(embed_dim, num_classes, head_hid, head_drop)
+    # ===================================================================
+    # MODE: eval -- load existing head checkpoint and evaluate only
+    # ===================================================================
+    if MODE == "eval":
+        print(f"\n*** Evaluation-only mode -- loading head from {PATH_HEAD_CHECKPOINT} ***")
+        head_ckpt = torch.load(PATH_HEAD_CHECKPOINT, map_location=device, weights_only=False)
+        saved_cfg = head_ckpt.get("train_config", {})
+        head = MLPHead(embed_dim, num_classes,
+                       saved_cfg.get("head_hidden_dim", HEAD_HIDDEN_DIM),
+                       saved_cfg.get("head_dropout", HEAD_DROPOUT))
         model = MAEClassifier(encoder, head).to(device)
         model.head.load_state_dict(head_ckpt["head_state_dict"])
-
         print(f"Head loaded (trained epoch {head_ckpt.get('epoch', '?')}, "
-              f"val_bal_acc={100*head_ckpt.get('val_bal_acc', 0):.2f}%)")
-
-        val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, device)
-
-        val_paths: List[str] = []
-        for idx in val_ds.indices:
-            val_paths.append(ds.data[idx]["img"])
+              f"val_bal_acc={100 * head_ckpt.get('val_bal_acc', 0):.2f}%)")
 
         print("\n" + "=" * 60)
         print("EVALUATION RESULTS")
         print("=" * 60)
-
-        metrics = compute_and_print_metrics(y_true, y_pred, ds.class_names, num_classes)
-        save_results(metrics, y_true, y_pred, val_paths, ds.class_names)
+        _final_evaluate(model, val_loader, val_ds, ds, criterion)
         return
 
-    # ---- Training mode ----
-    head = MLPHead(embed_dim, num_classes, HEAD_HIDDEN_DIM, HEAD_DROPOUT)
-    model = MAEClassifier(encoder, head).to(device)
-
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    print(f"Parameters: {n_trainable:,} trainable | {n_frozen:,} frozen")
-
-    optimizer = optim.AdamW(model.head.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-
-    # --- Build reproducibility config ---
-    train_config = build_train_config(
-        PATH_MAE_CHECKPOINT, ckpt_info, ds, len(train_ds), len(val_ds),
-    )
+    # ===================================================================
+    # MODE: train or resume
+    # ===================================================================
+    start_epoch = 1
+    best_val_bal_acc = 0.0
+    best_epoch = 0
     history: Dict[str, List[float]] = {
         "train_loss": [], "train_acc": [],
         "val_loss": [], "val_acc": [], "val_bal_acc": [], "val_f1": [],
     }
 
-    # --- Training loop ---
-    best_val_bal_acc = 0.0
-    best_epoch = 0
-    for epoch in range(1, EPOCHS + 1):
+    if MODE == "resume":
+        print(f"\n*** Resume mode -- loading head from {PATH_HEAD_CHECKPOINT} ***")
+        head_ckpt = torch.load(PATH_HEAD_CHECKPOINT, map_location=device, weights_only=False)
+        saved_cfg = head_ckpt.get("train_config", {})
+        head = MLPHead(embed_dim, num_classes,
+                       saved_cfg.get("head_hidden_dim", HEAD_HIDDEN_DIM),
+                       saved_cfg.get("head_dropout", HEAD_DROPOUT))
+        model = MAEClassifier(encoder, head).to(device)
+        model.head.load_state_dict(head_ckpt["head_state_dict"])
+        optimizer = optim.AdamW(model.head.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+        if "optimizer_state_dict" in head_ckpt:
+            optimizer.load_state_dict(head_ckpt["optimizer_state_dict"])
+        saved_epoch = head_ckpt.get("epoch", 0)
+        start_epoch = saved_epoch + 1
+        best_val_bal_acc = head_ckpt.get("val_bal_acc", 0.0)
+        best_epoch = saved_epoch
+        if "history" in head_ckpt:
+            for k in history:
+                history[k] = list(head_ckpt["history"].get(k, []))
+        print(f"Resumed from epoch {saved_epoch} "
+              f"(val_bal_acc={100 * best_val_bal_acc:.2f}%), "
+              f"will train to epoch {EPOCHS}")
+    else:
+        head = MLPHead(embed_dim, num_classes, HEAD_HIDDEN_DIM, HEAD_DROPOUT)
+        model = MAEClassifier(encoder, head).to(device)
+        optimizer = optim.AdamW(model.head.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    print(f"Parameters: {n_trainable:,} trainable | {n_frozen:,} frozen")
+
+    train_config = build_train_config(
+        PATH_MAE_CHECKPOINT, ckpt_info, ds, len(train_ds), len(val_ds),
+    )
+
+    for epoch in range(start_epoch, EPOCHS + 1):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device, epoch,
         )
@@ -592,38 +653,29 @@ def main():
         if improved:
             best_val_bal_acc = val_bal_acc
             best_epoch = epoch
-            torch.save({
-                "head_state_dict": model.head.state_dict(),
-                "epoch": epoch,
-                "val_bal_acc": val_bal_acc,
-                "train_config": train_config,
-            }, head_ckpt_path)
+            _save_head_checkpoint(
+                model, optimizer, epoch, val_bal_acc,
+                train_config, history, PATH_HEAD_CHECKPOINT,
+            )
 
         print(
             f"Epoch {epoch:3d}/{EPOCHS} | "
-            f"train_loss={train_loss:.4f} train_acc={100*train_acc:.2f}% | "
-            f"val_loss={val_loss:.4f} val_acc={100*val_acc:.2f}% "
-            f"val_bal_acc={100*val_bal_acc:.2f}% val_f1={val_f1:.4f}"
-            f"{'  *best*' if improved else ''}"
+            f"train_loss={train_loss:.4f} train_acc={100 * train_acc:.2f}% | "
+            f"val_loss={val_loss:.4f} val_acc={100 * val_acc:.2f}% "
+            f"val_bal_acc={100 * val_bal_acc:.2f}% val_f1={val_f1:.4f}"
+            + ("  *best*" if improved else "")
         )
 
-    print(f"\nBest validation balanced accuracy: {100*best_val_bal_acc:.2f}% at epoch {best_epoch}")
+    print(f"\nBest validation balanced accuracy: {100 * best_val_bal_acc:.2f}% at epoch {best_epoch}")
 
-    # --- Final evaluation with best head ---
-    best_ckpt = torch.load(head_ckpt_path, map_location=device, weights_only=False)
+    best_ckpt = torch.load(PATH_HEAD_CHECKPOINT, map_location=device, weights_only=False)
     model.head.load_state_dict(best_ckpt["head_state_dict"])
-    val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, device)
-
-    val_paths: List[str] = []
-    for idx in val_ds.indices:
-        val_paths.append(ds.data[idx]["img"])
 
     print("\n" + "=" * 60)
     print("FINAL RESULTS (best checkpoint on validation set)")
     print("=" * 60)
 
-    metrics = compute_and_print_metrics(y_true, y_pred, ds.class_names, num_classes)
-    save_results(metrics, y_true, y_pred, val_paths, ds.class_names)
+    metrics = _final_evaluate(model, val_loader, val_ds, ds, criterion)
     save_run_config(train_config, history, final_metrics=metrics, path=CONFIG_PATH)
 
 
