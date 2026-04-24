@@ -55,6 +55,9 @@ ENV HEAD_HIDDEN_DIM="0"
 ENV HEAD_DROPOUT="0.1"
 ENV NUM_WORKERS="4"
 ENV MAX_IMAGE_HEIGHT="224"
+# Per-image z-score standardisation; must match MAE pre-training transform.
+# Set to "0" only when evaluating a legacy MAE checkpoint trained without it.
+ENV STANDARDIZE_INPUT="1"
 ENV SEED="42"
 ENV EVAL_ONLY="0"
 ENV PATH_HEAD_CHECKPOINT="best_head.pt"

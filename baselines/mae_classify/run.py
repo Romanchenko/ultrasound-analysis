@@ -62,6 +62,14 @@ MAX_IMAGE_HEIGHT = int(
         os.environ.get("IMAGE_HEIGHT", os.environ.get("IMAGE_SIZE", "224")),
     )
 )
+# Per-image z-score standardisation ``(img - mean) / std``. Must match the
+# transform used to pre-train the MAE encoder (see
+# ``embeddings.vit.train.standardize_per_image``). Setting this to ``0`` is
+# only correct when evaluating a legacy checkpoint pre-trained without
+# standardisation.
+STANDARDIZE_INPUT = os.environ.get("STANDARDIZE_INPUT", "1").strip().lower() in (
+    "1", "true", "yes",
+)
 SEED = int(os.environ.get("SEED", "42"))
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "run_config.json")
 PATH_HEAD_CHECKPOINT = os.environ.get("PATH_HEAD_CHECKPOINT", "best_head.pt")
@@ -86,12 +94,29 @@ def _parse_exclude_ids(raw: str) -> Set[int]:
 # Image helpers
 # ---------------------------------------------------------------------------
 
+def _standardize_per_image(img: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Per-image z-score normalisation ``(img - mean) / std`` over all pixels.
+
+    Mirror of :func:`embeddings.vit.train.standardize_per_image` so the
+    classifier sees the same pixel distribution the MAE encoder was trained on.
+    """
+    mean = img.mean()
+    std = img.std().clamp_min(eps)
+    return (img - mean) / std
+
+
 def load_npy_as_grayscale_tensor(
-    path: str, max_image_height: int,
+    path: str, max_image_height: int, standardize: bool = True,
 ) -> torch.Tensor:
-    """Load a ``.npy`` RGB image, convert to grayscale ``[1, H, W]`` float tensor
-    in ``[0, 1]``. If ``H > max_image_height``, shrink so ``H = max_image_height``
-    (aspect ratio kept; never upscaled, never letterboxed). Otherwise return as-is.
+    """Load a ``.npy`` RGB image, convert to grayscale ``[1, H, W]`` float tensor.
+
+    * Raw pixels are scaled to ``[0, 1]``.
+    * If ``H > max_image_height``, shrink so ``H = max_image_height`` (aspect
+      ratio kept; never upscaled, never letterboxed).
+    * If ``standardize`` is True (default), apply per-image z-score so the
+      tensor matches the distribution the MAE encoder was pre-trained on
+      (see ``embeddings.vit.train.standardize_per_image``). This flag must
+      be set identically at MAE pre-training and at classification time.
     """
     import torchvision.transforms.functional as F
 
@@ -111,6 +136,9 @@ def load_npy_as_grayscale_tensor(
             interpolation=F.InterpolationMode.BILINEAR,
             antialias=True,
         )
+
+    if standardize:
+        tensor = _standardize_per_image(tensor)
     return tensor
 
 
@@ -159,6 +187,7 @@ class ClassificationDataset(Dataset):
         max_image_height: int = 224,
         exclude_class_ids: Optional[Set[int]] = None,
         image_ext: str = "",
+        standardize: bool = True,
     ):
         if exclude_class_ids is None:
             exclude_class_ids = set()
@@ -186,13 +215,16 @@ class ClassificationDataset(Dataset):
             })
 
         self.max_image_height = max_image_height
+        self.standardize = bool(standardize)
 
     def __len__(self) -> int:
         return len(self.data)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, int, str]:
         entry = self.data[index]
-        img = load_npy_as_grayscale_tensor(entry["img"], self.max_image_height)
+        img = load_npy_as_grayscale_tensor(
+            entry["img"], self.max_image_height, standardize=self.standardize,
+        )
         return img, entry["seq_idx"], entry["img"]
 
 
@@ -392,6 +424,7 @@ def build_train_config(
         "image_ext": IMAGE_EXT,
         "exclude_class_ids": sorted(_parse_exclude_ids(EXCLUDE_CLASS_IDS)),
         "max_image_height": MAX_IMAGE_HEIGHT,
+        "standardize_input": STANDARDIZE_INPUT,
         "epochs": EPOCHS,
         "batch_size": BATCH_SIZE,
         "lr": LR,
@@ -553,6 +586,11 @@ def main():
         max_image_height=MAX_IMAGE_HEIGHT,
         exclude_class_ids=exclude_ids,
         image_ext=IMAGE_EXT,
+        standardize=STANDARDIZE_INPUT,
+    )
+    print(
+        f"Input standardisation: {'ON' if STANDARDIZE_INPUT else 'OFF'} "
+        f"(must match the MAE pre-training transform)"
     )
     num_classes = ds.num_classes
     print(f"Dataset: {len(ds)} samples, {num_classes} classes")
