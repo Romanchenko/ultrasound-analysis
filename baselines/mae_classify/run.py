@@ -8,6 +8,9 @@ balanced accuracy, F1, and a confusion matrix.
 All paths and hyperparameters are configurable via environment variables
 (see the table in the accompanying readme / plan).
 
+Each training epoch writes ``METRICS_CSV`` (default ``training_metrics.csv``) with
+loss, accuracy, and balanced accuracy for **train** and **validation**.
+
 Usage::
 
     DIR_IMAGES=/data/npy \
@@ -73,6 +76,8 @@ STANDARDIZE_INPUT = os.environ.get("STANDARDIZE_INPUT", "1").strip().lower() in 
 SEED = int(os.environ.get("SEED", "42"))
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "run_config.json")
 PATH_HEAD_CHECKPOINT = os.environ.get("PATH_HEAD_CHECKPOINT", "best_head.pt")
+# Per-epoch metrics table for plotting (loss, accuracy, balanced accuracy).
+METRICS_CSV = os.environ.get("METRICS_CSV", "training_metrics.csv")
 _mode_raw = os.environ.get("MODE", "train").strip().lower()
 _eval_flag = os.environ.get("EVAL_ONLY", "").strip().lower() in ("1", "true", "yes")
 MODE = "eval" if _eval_flag else _mode_raw
@@ -280,11 +285,14 @@ def train_one_epoch(
     criterion: nn.Module,
     device_: torch.device,
     epoch: int,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
+    """Returns ``(mean_loss, accuracy, balanced_accuracy)`` on the training set."""
     model.train()
     total_loss = 0.0
     correct = 0
     total = 0
+    all_true: List[np.ndarray] = []
+    all_pred: List[np.ndarray] = []
 
     pbar = tqdm(loader, desc=f"Epoch {epoch} [train]", leave=False)
     for imgs, pad_masks, labels, _paths in pbar:
@@ -299,11 +307,19 @@ def train_one_epoch(
         optimizer.step()
 
         total_loss += loss.item() * labels.size(0)
-        correct += (logits.argmax(dim=1) == labels).sum().item()
+        pred = logits.argmax(dim=1)
+        correct += (pred == labels).sum().item()
         total += labels.size(0)
+        all_true.append(labels.detach().cpu().numpy())
+        all_pred.append(pred.detach().cpu().numpy())
         pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{100 * correct / total:.1f}%")
 
-    return total_loss / max(total, 1), correct / max(total, 1)
+    y_true = np.concatenate(all_true) if all_true else np.array([])
+    y_pred = np.concatenate(all_pred) if all_pred else np.array([])
+    train_bal = (
+        float(balanced_accuracy_score(y_true, y_pred)) if len(y_true) > 0 else 0.0
+    )
+    return total_loss / max(total, 1), correct / max(total, 1), train_bal
 
 
 @torch.no_grad()
@@ -369,6 +385,39 @@ def stratified_split(
 # ---------------------------------------------------------------------------
 # Metrics & output
 # ---------------------------------------------------------------------------
+
+
+def write_training_metrics_csv(
+    history: Dict[str, List[float]],
+    path: str,
+) -> None:
+    """Write one row per epoch: loss, accuracy, balanced accuracy for train and val.
+
+    Intended for plotting (pandas, matplotlib, seaborn, etc.).
+    """
+    n = len(history["train_loss"])
+    if n == 0:
+        return
+
+    rows: List[Dict[str, object]] = []
+    for i in range(n):
+        row: Dict[str, object] = {
+            "epoch": i + 1,
+            "train_loss": float(history["train_loss"][i]),
+            "train_accuracy": float(history["train_acc"][i]),
+            "train_balanced_accuracy": float(history["train_bal_acc"][i]),
+            "val_loss": float(history["val_loss"][i]),
+            "val_accuracy": float(history["val_acc"][i]),
+            "val_balanced_accuracy": float(history["val_bal_acc"][i]),
+        }
+        rows.append(row)
+
+    out = os.path.abspath(path)
+    parent = os.path.dirname(out)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out, index=False)
+
 
 def compute_and_print_metrics(
     y_true: np.ndarray,
@@ -438,6 +487,7 @@ def build_train_config(
         "num_classes": dataset.num_classes,
         "n_train_samples": n_train,
         "n_val_samples": n_val,
+        "metrics_csv": os.path.abspath(METRICS_CSV),
         "class_mapping": {
             str(seq): {"orig_idx": dataset.seq_to_orig[seq], "name": dataset.class_names[seq]}
             for seq in sorted(dataset.class_names)
@@ -647,8 +697,13 @@ def main():
     best_val_bal_acc = 0.0
     best_epoch = 0
     history: Dict[str, List[float]] = {
-        "train_loss": [], "train_acc": [],
-        "val_loss": [], "val_acc": [], "val_bal_acc": [], "val_f1": [],
+        "train_loss": [],
+        "train_acc": [],
+        "train_bal_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+        "val_bal_acc": [],
+        "val_f1": [],
     }
 
     if MODE == "resume":
@@ -668,8 +723,13 @@ def main():
         best_val_bal_acc = head_ckpt.get("val_bal_acc", 0.0)
         best_epoch = saved_epoch
         if "history" in head_ckpt:
+            saved = head_ckpt["history"]
+            n_ep = len(saved.get("train_loss", []))
             for k in history:
-                history[k] = list(head_ckpt["history"].get(k, []))
+                v = list(saved.get(k, []))
+                while len(v) < n_ep:
+                    v.append(float("nan"))
+                history[k] = v[:n_ep]
         print(f"Resumed from epoch {saved_epoch} "
               f"(val_bal_acc={100 * best_val_bal_acc:.2f}%), "
               f"will train to epoch {EPOCHS}")
@@ -685,9 +745,10 @@ def main():
     train_config = build_train_config(
         PATH_MAE_CHECKPOINT, ckpt_info, ds, len(train_ds), len(val_ds),
     )
+    print(f"Per-epoch metrics (loss / accuracy / balanced accuracy): {os.path.abspath(METRICS_CSV)}")
 
     for epoch in range(start_epoch, EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_acc, train_bal_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device, epoch,
         )
         val_loss, val_acc, y_true, y_pred = evaluate(
@@ -698,10 +759,13 @@ def main():
 
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
+        history["train_bal_acc"].append(train_bal_acc)
         history["val_loss"].append(val_loss)
         history["val_acc"].append(val_acc)
         history["val_bal_acc"].append(val_bal_acc)
         history["val_f1"].append(val_f1)
+
+        write_training_metrics_csv(history, METRICS_CSV)
 
         improved = val_bal_acc > best_val_bal_acc
         if improved:

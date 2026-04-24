@@ -62,6 +62,8 @@ ENV SEED="42"
 ENV EVAL_ONLY="0"
 ENV PATH_HEAD_CHECKPOINT="best_head.pt"
 ENV CONFIG_PATH="run_config.json"
+# Per-epoch metrics CSV (train/val loss, acc, balanced acc).
+ENV METRICS_CSV="training_metrics.csv"
 ENV MODE="train"
 ENV DEVICE=""
 
