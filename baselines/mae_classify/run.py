@@ -16,6 +16,7 @@ Usage::
 """
 
 import json
+import math
 import os
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -52,7 +53,15 @@ VAL_SPLIT = float(os.environ.get("VAL_SPLIT", "0.2"))
 HEAD_HIDDEN_DIM = int(os.environ.get("HEAD_HIDDEN_DIM", "0"))
 HEAD_DROPOUT = float(os.environ.get("HEAD_DROPOUT", "0.1"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
-IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
+# Cap on per-image height (aspect preserved, never upscaled, never letterboxed
+# to a fixed width). Legacy ``IMAGE_HEIGHT`` / ``IMAGE_SIZE`` fall back to the
+# same value.
+MAX_IMAGE_HEIGHT = int(
+    os.environ.get(
+        "MAX_IMAGE_HEIGHT",
+        os.environ.get("IMAGE_HEIGHT", os.environ.get("IMAGE_SIZE", "224")),
+    )
+)
 SEED = int(os.environ.get("SEED", "42"))
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "run_config.json")
 PATH_HEAD_CHECKPOINT = os.environ.get("PATH_HEAD_CHECKPOINT", "best_head.pt")
@@ -78,15 +87,14 @@ def _parse_exclude_ids(raw: str) -> Set[int]:
 # ---------------------------------------------------------------------------
 
 def load_npy_as_grayscale_tensor(
-    path: str, image_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    path: str, max_image_height: int,
+) -> torch.Tensor:
     """Load a ``.npy`` RGB image, convert to grayscale ``[1, H, W]`` float tensor
-    in ``[0, 1]``, and resize with aspect-preserving zero-padding.
-
-    Returns:
-        image:    ``[1, image_size, image_size]``
-        pad_mask: ``[1, image_size, image_size]`` boolean, True where pixel is padding.
+    in ``[0, 1]``. If ``H > max_image_height``, shrink so ``H = max_image_height``
+    (aspect ratio kept; never upscaled, never letterboxed). Otherwise return as-is.
     """
+    import torchvision.transforms.functional as F
+
     npy = np.load(path)
     if npy.dtype != np.uint8:
         npy = np.clip(npy, 0, 255).astype(np.uint8)
@@ -94,42 +102,43 @@ def load_npy_as_grayscale_tensor(
     img = Image.fromarray(npy, mode="RGB").convert("L")
     tensor = torch.from_numpy(np.array(img)).float().unsqueeze(0) / 255.0
 
-    return _resize_keep_aspect_pad(tensor, image_size)
+    _, h, w = tensor.shape
+    if max_image_height and h > max_image_height:
+        new_h = int(max_image_height)
+        new_w = max(1, int(round(w * new_h / h)))
+        tensor = F.resize(
+            tensor, [new_h, new_w],
+            interpolation=F.InterpolationMode.BILINEAR,
+            antialias=True,
+        )
+    return tensor
 
 
-def _resize_keep_aspect_pad(
-    img: torch.Tensor, size: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Resize ``[1, H, W]`` tensor to ``[1, size, size]`` keeping aspect ratio,
-    zero-padding the shorter side.
-
-    Returns:
-        padded:   ``[1, size, size]``
-        pad_mask: ``[1, size, size]`` boolean, True where pixel is padding.
+def pad_classify_collate(
+    batch: List[Tuple[torch.Tensor, int, str]], patch_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
     """
-    import torchvision.transforms.functional as F
+    Collate variable-shape ``[1, H_i, W_i]`` images into a zero-padded batch.
 
-    _, h, w = img.shape
-    scale = min(size / h, size / w)
-    new_h, new_w = int(round(h * scale)), int(round(w * scale))
-    resized = F.resize(
-        img, [new_h, new_w],
-        interpolation=F.InterpolationMode.BILINEAR,
-        antialias=True,
-    )
-    pad_h = size - new_h
-    pad_w = size - new_w
-    pad_top = pad_h // 2
-    pad_left = pad_w // 2
-    padded = F.pad(
-        resized,
-        [pad_left, pad_top, pad_w - pad_left, pad_h - pad_top],
-        fill=0,
-    )
-
-    pad_mask = torch.ones(1, size, size, dtype=torch.bool)
-    pad_mask[:, pad_top:pad_top + new_h, pad_left:pad_left + new_w] = False
-    return padded, pad_mask
+    Output shapes: ``(max_h, max_w)`` rounded up to a ``patch_size`` multiple,
+    plus a boolean ``pad_mask`` (True on padded pixels).
+    """
+    imgs = [it[0] for it in batch]
+    labels = torch.tensor([int(it[1]) for it in batch], dtype=torch.long)
+    paths = [str(it[2]) for it in batch]
+    C = imgs[0].shape[0]
+    max_h = max(int(img.shape[-2]) for img in imgs)
+    max_w = max(int(img.shape[-1]) for img in imgs)
+    H = math.ceil(max_h / patch_size) * patch_size
+    W = math.ceil(max_w / patch_size) * patch_size
+    B = len(imgs)
+    images = torch.zeros(B, C, H, W, dtype=imgs[0].dtype)
+    pad_masks = torch.ones(B, 1, H, W, dtype=torch.bool)
+    for i, img in enumerate(imgs):
+        _, h, w = img.shape
+        images[i, :, :h, :w] = img
+        pad_masks[i, :, :h, :w] = False
+    return images, pad_masks, labels, paths
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +156,7 @@ class ClassificationDataset(Dataset):
         self,
         dir_images: str,
         path_csv: str,
-        image_size: int = 224,
+        max_image_height: int = 224,
         exclude_class_ids: Optional[Set[int]] = None,
         image_ext: str = "",
     ):
@@ -176,15 +185,15 @@ class ClassificationDataset(Dataset):
                 "seq_idx": self.orig_to_seq[int(row["class_idx"])],
             })
 
-        self.image_size = image_size
+        self.max_image_height = max_image_height
 
     def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, int, str]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int, str]:
         entry = self.data[index]
-        img, pad_mask = load_npy_as_grayscale_tensor(entry["img"], self.image_size)
-        return img, pad_mask, entry["seq_idx"], entry["img"]
+        img = load_npy_as_grayscale_tensor(entry["img"], self.max_image_height)
+        return img, entry["seq_idx"], entry["img"]
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +255,7 @@ def train_one_epoch(
     total = 0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch} [train]", leave=False)
-    for imgs, pad_masks, labels, _ in pbar:
+    for imgs, pad_masks, labels, _paths in pbar:
         imgs = imgs.to(device_)
         pad_masks = pad_masks.to(device_)
         labels = labels.to(device_)
@@ -280,7 +289,7 @@ def evaluate(
     all_true: List[np.ndarray] = []
     all_pred: List[np.ndarray] = []
 
-    for imgs, pad_masks, labels, _ in loader:
+    for imgs, pad_masks, labels, _paths in loader:
         imgs = imgs.to(device_)
         pad_masks = pad_masks.to(device_)
         labels = labels.to(device_)
@@ -382,7 +391,7 @@ def build_train_config(
         "path_csv": os.path.abspath(PATH_CSV),
         "image_ext": IMAGE_EXT,
         "exclude_class_ids": sorted(_parse_exclude_ids(EXCLUDE_CLASS_IDS)),
-        "image_size": IMAGE_SIZE,
+        "max_image_height": MAX_IMAGE_HEIGHT,
         "epochs": EPOCHS,
         "batch_size": BATCH_SIZE,
         "lr": LR,
@@ -541,7 +550,7 @@ def main():
     ds = ClassificationDataset(
         dir_images=DIR_IMAGES,
         path_csv=PATH_CSV,
-        image_size=IMAGE_SIZE,
+        max_image_height=MAX_IMAGE_HEIGHT,
         exclude_class_ids=exclude_ids,
         image_ext=IMAGE_EXT,
     )
@@ -554,13 +563,20 @@ def main():
     train_ds, val_ds = stratified_split(ds, VAL_SPLIT, SEED)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
+    patch_size = int(encoder.patch_size)
+
+    def _collate(batch):
+        return pad_classify_collate(batch, patch_size)
+
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=NUM_WORKERS, pin_memory=False, drop_last=True,
+        collate_fn=_collate,
     )
     val_loader = DataLoader(
         val_ds, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=False,
+        collate_fn=_collate,
     )
 
     criterion = nn.CrossEntropyLoss()

@@ -4,15 +4,15 @@ Loads grayscale ultrasound images with configurable transformations.
 """
 
 import os
+import warnings
+
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-from typing import List, Optional, Callable, Any, Dict
+from typing import Any, Callable, Dict, List, Optional
 from pathlib import Path
 import torchvision.transforms as transforms
-
-from embeddings.vit.train import resize_keep_aspect_pad
 
 
 def composite_plane_label(plane: str, brain_plane: str) -> str:
@@ -28,17 +28,24 @@ def composite_plane_label(plane: str, brain_plane: str) -> str:
 class FetalPlanesDBDataset(Dataset):
     """
     Dataset class for FETAL_PLANES_DB grayscale ultrasound images.
-    
+
+    Images are returned at their **native** resolution as grayscale tensors
+    ``[1, H, W]``. Each sample keeps its own aspect ratio. Any required sizing
+    (shrink to a max height, pad to a ``patch_size`` multiple) is handled
+    downstream by the MAE pipeline
+    (:func:`embeddings.vit.train.apply_max_height_shrink`,
+    :func:`embeddings.vit.train.mae_pad_collate`).
+
     Dataset structure:
         root/
             FETAL_PLANES_DB_data.csv
             images/
                 <image_name>.png
-    
+
     Args:
         root: Root directory of the dataset
-        transform: List of transformation functions to apply (default: resize_keep_aspect_pad)
-        target_size: Target size for resize (default: (224, 224), assumes square)
+        transform: Optional list of callables composed into a single transform.
+                   When ``None``, just :class:`torchvision.transforms.ToTensor`.
         csv_file: Name of the CSV file (default: 'FETAL_PLANES_DB_data.csv')
         images_dir: Name of images directory (default: 'images')
         train: If True, load training set; if False, load validation set; if None, load all (default: None)
@@ -46,21 +53,28 @@ class FetalPlanesDBDataset(Dataset):
                       (see :func:`composite_plane_label`). If provided, ``__getitem__`` returns
                       ``label_idx`` and ``label_name`` is the composite string.
     """
-    
+
     def __init__(
         self,
         root: str,
         transform: Optional[List[Callable]] = None,
-        target_size: tuple = (224, 224),
         csv_file: str = 'FETAL_PLANES_DB_data.csv',
         images_dir: str = 'images',
         train: Optional[bool] = None,
-        class_to_idx: Optional[Dict[str, int]] = None
+        class_to_idx: Optional[Dict[str, int]] = None,
+        target_size: Optional[Any] = None,  # deprecated, ignored
     ):
+        if target_size is not None:
+            warnings.warn(
+                "FetalPlanesDBDataset(target_size=...) is deprecated and ignored: "
+                "images are now returned at their native resolution and sized by "
+                "the MAE pipeline (apply_max_height_shrink + mae_pad_collate). "
+                "Each image keeps its own aspect ratio.",
+                DeprecationWarning, stacklevel=2,
+            )
         self.root = Path(root)
         self.images_dir = self.root / images_dir
         self.csv_path = self.root / csv_file
-        self.target_size = target_size
         self.class_to_idx = class_to_idx
         self.idx_to_class = {v: k for k, v in class_to_idx.items()} if class_to_idx else None
         
@@ -111,32 +125,13 @@ class FetalPlanesDBDataset(Dataset):
         
         print(f"Loaded {len(self.image_paths)} images from {self.root}")
         
-        # Set up transforms
+        # Default: PIL → [1, H, W] grayscale tensor at native resolution.
+        # Any size normalisation happens downstream (MAE pipeline or custom
+        # transform passed in via ``transform=...``).
         if transform is None:
-            # Default: resize_keep_aspect_pad (aspect ratio preserved, zero padding)
-            self.transform = self._get_default_transforms()
+            self.transform = transforms.ToTensor()
         else:
             self.transform = transforms.Compose(transform) if transform else None
-    
-    def _get_default_transforms(self) -> transforms.Compose:
-        """
-        Get default transforms: resize with aspect ratio preserved and zero padding.
-
-        Uses resize_keep_aspect_pad to fit within target_size while keeping proportions.
-        """
-        size = self.target_size[0]  # assumes square (H, W) e.g. (224, 224)
-
-        def resize_pad_transform(img: torch.Tensor) -> torch.Tensor:
-            return resize_keep_aspect_pad(
-                img,
-                size=size,
-                interpolation=transforms.InterpolationMode.BILINEAR,
-            )
-
-        return transforms.Compose([
-            transforms.ToTensor(),  # Convert to tensor [1, H, W] for grayscale
-            transforms.Lambda(resize_pad_transform),
-        ])
     
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -163,8 +158,8 @@ class FetalPlanesDBDataset(Dataset):
             image = Image.open(image_path).convert('L')  # 'L' mode for grayscale
         except Exception as e:
             print(f"Error loading image {image_path}: {e}")
-            # Return a black image as fallback
-            image = Image.new('L', self.target_size, color=0)
+            # Tiny black fallback; downstream code will pad to a patch multiple.
+            image = Image.new('L', (16, 16), color=0)
         
         # Apply transforms
         if self.transform:

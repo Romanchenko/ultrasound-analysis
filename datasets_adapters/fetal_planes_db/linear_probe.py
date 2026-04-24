@@ -1,8 +1,14 @@
 """
 Linear probe evaluation: train a classification head on frozen encoder embeddings.
 
-Evaluates any pretrained encoder on the fetal_planes_db (Plane, Brain_plane) classification
-task. The encoder is frozen; only a linear head is trained.
+Evaluates any pretrained encoder on the fetal_planes_db (Plane, Brain_plane)
+classification task. The encoder is frozen; only a linear head is trained.
+
+Images are consumed at **variable** spatial size: each sample is shrunk to at
+most ``max_image_height`` (aspect preserved, no up-scaling), and the batch is
+zero-padded (right/bottom) to a common ``(H, W)`` that is divisible by
+``patch_size`` via :func:`pad_classify_collate`. A boolean ``pad_mask`` is
+produced per sample and forwarded to ``encoder.encode`` when supported.
 
 Usage::
 
@@ -12,25 +18,28 @@ Usage::
     from embeddings.vit.train import load_checkpoint
     encoder, _ = load_checkpoint("checkpoints/mae_final.pt")
 
-    # With any encoder that has .encode(imgs) -> [B, embed_dim]
     history = train_linear_probe(
         encoder=encoder,
-        embed_dim=encoder.embed_dim,  # or 384 for MAE default
+        embed_dim=encoder.embed_dim,
         dataset_root="path/to/FETAL_PLANES_DB",
-        image_size=224,
+        max_image_height=512,
         epochs=50,
     )
 """
 
+import inspect
+import math
 import os
-from typing import Callable, Dict, List, Optional, Tuple
+import warnings
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from .fpd_dataset import FetalPlanesDBDataset
@@ -120,10 +129,12 @@ class LinearProbe(nn.Module):
     Frozen encoder + trainable linear classification head.
 
     Encoder can be any module with:
-      - .encode(imgs) -> [B, embed_dim], or
-      - .forward(imgs) -> [B, embed_dim] (embedding as direct output)
+      - ``.encode(imgs)`` or ``.encode(imgs, pad_mask=...)`` -> ``[B, embed_dim]``, or
+      - ``.forward(imgs)`` -> ``[B, embed_dim]`` (embedding as direct output)
 
-    The encoder is kept in eval mode and its parameters are frozen.
+    The encoder is kept in eval mode and its parameters are frozen. When the
+    encoder's ``.encode`` signature accepts a ``pad_mask`` kwarg, the probe
+    forwards the pixel pad mask produced by :func:`pad_classify_collate`.
     """
 
     def __init__(
@@ -136,24 +147,57 @@ class LinearProbe(nn.Module):
         self.encoder = encoder
         self.head = nn.Linear(embed_dim, num_classes)
         self._use_encode = hasattr(encoder, "encode")
-
-    def _get_embeddings(self, x: torch.Tensor) -> torch.Tensor:
+        self._encode_supports_pad_mask = False
         if self._use_encode:
+            try:
+                sig = inspect.signature(encoder.encode)
+                self._encode_supports_pad_mask = "pad_mask" in sig.parameters
+            except (TypeError, ValueError):
+                self._encode_supports_pad_mask = False
+
+    def _get_embeddings(
+        self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self._use_encode:
+            if self._encode_supports_pad_mask:
+                return self.encoder.encode(x, pad_mask=pad_mask)
             return self.encoder.encode(x)
         return self.encoder(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         with torch.no_grad():
-            emb = self._get_embeddings(x)
+            emb = self._get_embeddings(x, pad_mask=pad_mask)
         return self.head(emb)
 
 
 # =====================================================================
-# Dataset wrapper & transform
+# Transforms & collate (variable-shape pipeline)
 # =====================================================================
 
-def _default_image_transform(image_size: int):
-    """Build transform: resize to image_size×image_size, ensure [1,H,W] grayscale."""
+def _apply_max_height_shrink(
+    img: torch.Tensor, max_image_height: Optional[int],
+) -> torch.Tensor:
+    """Shrink the image so its height is at most *max_image_height* (aspect
+    preserved). Never upscales. ``None`` / non-positive values are a no-op."""
+    if max_image_height is None or max_image_height <= 0:
+        return img
+    _, h, w = img.shape
+    if h <= max_image_height:
+        return img
+    new_w = max(1, int(round(w * max_image_height / h)))
+    return T.functional.resize(
+        img,
+        [int(max_image_height), new_w],
+        interpolation=T.InterpolationMode.BILINEAR,
+        antialias=True,
+    )
+
+
+def _default_image_transform(max_image_height: int) -> Callable[[dict], torch.Tensor]:
+    """Build a transform: normalise to ``[1, H, W]`` grayscale and shrink if
+    the height exceeds *max_image_height* (aspect preserved, no upscale)."""
 
     def transform(sample: dict) -> torch.Tensor:
         img = sample["image"]
@@ -163,16 +207,54 @@ def _default_image_transform(image_size: int):
             img = img.unsqueeze(0)
         if img.size(0) > 1:
             img = img.mean(dim=0, keepdim=True)
-        img = T.functional.resize(
-            img,
-            [image_size, image_size],
-            interpolation=T.InterpolationMode.BILINEAR,
-            antialias=True,
-        )
+        img = _apply_max_height_shrink(img, max_image_height)
         return img
 
     return transform
 
+
+def pad_classify_collate(
+    batch: List[Tuple[torch.Tensor, torch.Tensor]], patch_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Collate variable-shape ``[1, H_i, W_i]`` images + labels into a single batch.
+
+    Images are zero-padded (right and bottom only) to ``(max_h, max_w)``, each
+    rounded **up** to a multiple of ``patch_size``. Returns
+    ``(images, pad_masks, labels)``:
+
+    * ``images``:    ``[B, C, H', W']`` float
+    * ``pad_masks``: ``[B, 1, H', W']`` boolean, True where the pixel is padding.
+    * ``labels``:    ``[B]`` long tensor.
+    """
+    if len(batch) == 0:
+        raise ValueError("pad_classify_collate received an empty batch.")
+    imgs = [item[0] for item in batch]
+    labels = [item[1] for item in batch]
+
+    C = imgs[0].shape[0]
+    max_h = max(int(img.shape[-2]) for img in imgs)
+    max_w = max(int(img.shape[-1]) for img in imgs)
+    H = math.ceil(max_h / patch_size) * patch_size
+    W = math.ceil(max_w / patch_size) * patch_size
+    B = len(imgs)
+    images = torch.zeros(B, C, H, W, dtype=imgs[0].dtype)
+    pad_masks = torch.ones(B, 1, H, W, dtype=torch.bool)
+    for i, img in enumerate(imgs):
+        _, h, w = img.shape
+        images[i, :, :h, :w] = img
+        pad_masks[i, :, :h, :w] = False
+
+    labels_t = torch.stack([
+        lbl if isinstance(lbl, torch.Tensor) else torch.as_tensor(lbl)
+        for lbl in labels
+    ]).long()
+    return images, pad_masks, labels_t
+
+
+# =====================================================================
+# Dataset wrapper
+# =====================================================================
 
 class _ClassificationDatasetWrapper(Dataset):
     """Wraps FetalPlanesDBDataset and applies image transform."""
@@ -202,6 +284,31 @@ def _get_class_mapping(dataset: FetalPlanesDBDataset) -> Dict[str, int]:
     return class_to_idx
 
 
+def _infer_patch_size(encoder: nn.Module, default: int = 16) -> int:
+    """Read ``patch_size`` off the encoder (MAE-style); fall back to *default*."""
+    ps = getattr(encoder, "patch_size", None)
+    if ps is None:
+        ps = getattr(encoder, "patch_embed", None)
+        ps = getattr(ps, "patch_size", None) if ps is not None else None
+    try:
+        return int(ps) if ps is not None else int(default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _warn_legacy_kwargs(**kwargs: Any) -> None:
+    """Warn on removed/renamed keyword arguments (``image_size``, ``target_size``)."""
+    for name, val in kwargs.items():
+        if val is None:
+            continue
+        warnings.warn(
+            f"train_linear_probe({name}=...) is deprecated and ignored: the "
+            "linear probe now consumes variable-shape images (shrunk to "
+            "max_image_height, then padded per-batch to a patch_size multiple).",
+            DeprecationWarning, stacklevel=3,
+        )
+
+
 # =====================================================================
 # Training
 # =====================================================================
@@ -213,8 +320,8 @@ def train_linear_probe(
     *,
     images_dir: str = "Images",
     csv_file: str = "FETAL_PLANES_DB_data.csv",
-    image_size: int = 224,
-    target_size: Optional[Tuple[int, int]] = None,
+    max_image_height: int = 224,
+    patch_size: Optional[int] = None,
     image_transform: Optional[Callable[[dict], torch.Tensor]] = None,
     epochs: int = 50,
     batch_size: int = 64,
@@ -225,21 +332,28 @@ def train_linear_probe(
     checkpoint_dir: Optional[str] = None,
     save_every: int = 10,
     show_plot: bool = False,
+    # Legacy / deprecated:
+    image_size: Optional[int] = None,
+    target_size: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, List[float]]:
     """
     Train a linear classification head on frozen encoder embeddings for (Plane, Brain_plane).
 
     Args:
-        encoder: Pretrained encoder (any module with .encode(x) or callable returning
-                 [B, embed_dim]). Will be frozen.
+        encoder: Pretrained encoder (any module with .encode(x[, pad_mask=...])
+                 or callable returning ``[B, embed_dim]``). Will be frozen.
         embed_dim: Output dimension of the encoder embeddings.
         dataset_root: Root directory of FETAL_PLANES_DB.
         images_dir: Name of images subdirectory.
         csv_file: Name of CSV metadata file.
-        image_size: Spatial size to resize images to (must match encoder expectation).
-        target_size: (H, W) for dataset's initial load. Defaults to (image_size, image_size).
-        image_transform: Optional callable taking a sample dict and returning an image
-                         tensor [1, H, W]. If None, uses default resize to image_size.
+        max_image_height: Cap on image height. Images taller than this are
+                          shrunk (aspect preserved); shorter ones are left
+                          alone. Never upscales.
+        patch_size: Patch size used for batch padding. If ``None``, read from
+                    ``encoder.patch_size`` (falls back to 16).
+        image_transform: Optional callable taking a sample dict and returning
+                         an image tensor ``[1, H, W]`` (variable size). If
+                         ``None``, uses the default shrink-only transform.
         epochs: Number of training epochs.
         batch_size: Batch size.
         lr: Learning rate for the linear head.
@@ -248,43 +362,43 @@ def train_linear_probe(
         device: Device (auto-detect if None).
         checkpoint_dir: Where to save checkpoints (None = no saving).
         save_every: Save checkpoint every N epochs.
-        show_plot: If True, display the loss/accuracy/balanced-accuracy figure (e.g. notebooks).
+        show_plot: If True, display the loss/accuracy/balanced-accuracy figure.
+        image_size: **Deprecated** — ignored. Use ``max_image_height``.
+        target_size: **Deprecated** — ignored. Aspect ratio is preserved and
+                     images are no longer forced into a fixed canvas.
 
     Returns:
-        history: Dict with ``train_loss``, ``train_acc``, ``train_bal_acc``, ``val_loss``,
-                 ``val_acc``, ``val_bal_acc`` lists (accuracies as fractions in ``[0, 1]``).
+        history: Dict with ``train_loss``, ``train_acc``, ``train_bal_acc``,
+                 ``val_loss``, ``val_acc``, ``val_bal_acc`` lists (accuracies
+                 as fractions in ``[0, 1]``).
     """
+    _warn_legacy_kwargs(image_size=image_size, target_size=target_size)
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if target_size is None:
-        target_size = (image_size, image_size)
+    if patch_size is None:
+        patch_size = _infer_patch_size(encoder)
 
-    # Ensure encoder is frozen and in eval mode
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad = False
 
-    transform = image_transform or _default_image_transform(image_size)
+    transform = image_transform or _default_image_transform(max_image_height)
+    collate_fn = partial(pad_classify_collate, patch_size=int(patch_size))
 
-    # Scout dataset to build class mapping
     scout = FetalPlanesDBDataset(
         root=dataset_root,
         images_dir=images_dir,
         csv_file=csv_file,
-        target_size=target_size,
-        transform=[T.ToTensor()],
         train=True,
     )
     class_to_idx = _get_class_mapping(scout)
     num_classes = len(class_to_idx)
 
-    # Classification datasets with proper splits
     train_base = FetalPlanesDBDataset(
         root=dataset_root,
         images_dir=images_dir,
         csv_file=csv_file,
-        target_size=target_size,
-        transform=[T.ToTensor()],
         train=True,
         class_to_idx=class_to_idx,
     )
@@ -292,8 +406,6 @@ def train_linear_probe(
         root=dataset_root,
         images_dir=images_dir,
         csv_file=csv_file,
-        target_size=target_size,
-        transform=[T.ToTensor()],
         train=False,
         class_to_idx=class_to_idx,
     )
@@ -308,6 +420,7 @@ def train_linear_probe(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
@@ -315,6 +428,7 @@ def train_linear_probe(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
 
     model = LinearProbe(encoder, embed_dim, num_classes).to(device)
@@ -331,7 +445,6 @@ def train_linear_probe(
     }
 
     for epoch in range(epochs):
-        # Train
         model.train()
         train_loss = 0.0
         train_correct = 0
@@ -340,12 +453,13 @@ def train_linear_probe(
         train_preds_chunks: List[torch.Tensor] = []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [train]", leave=False)
 
-        for images, labels in pbar:
+        for images, pad_masks, labels in pbar:
             images = images.to(device)
+            pad_masks = pad_masks.to(device)
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(images)
+            logits = model(images, pad_mask=pad_masks)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
@@ -367,7 +481,6 @@ def train_linear_probe(
         else:
             train_bal_acc = 0.0
 
-        # Validate
         model.eval()
         val_loss = 0.0
         val_correct = 0
@@ -375,10 +488,11 @@ def train_linear_probe(
         val_labels_chunks: List[torch.Tensor] = []
         val_preds_chunks: List[torch.Tensor] = []
         with torch.no_grad():
-            for images, labels in val_loader:
+            for images, pad_masks, labels in val_loader:
                 images = images.to(device)
+                pad_masks = pad_masks.to(device)
                 labels = labels.to(device)
-                logits = model(images)
+                logits = model(images, pad_mask=pad_masks)
                 loss = criterion(logits, labels)
                 val_loss += loss.item()
                 pred = logits.argmax(dim=1)
@@ -418,9 +532,11 @@ def train_linear_probe(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "class_to_idx": class_to_idx,
                 "embed_dim": embed_dim,
+                "max_image_height": int(max_image_height),
+                "patch_size": int(patch_size),
                 "history": history,
             }, path)
-            print(f"  → checkpoint saved: {path}")
+            print(f"  -> checkpoint saved: {path}")
 
     plot_path = None
     if checkpoint_dir:
@@ -460,43 +576,51 @@ def make_fetal_planes_probe_dataloader(
     *,
     images_dir: str = "Images",
     csv_file: str = "FETAL_PLANES_DB_data.csv",
-    image_size: int = 224,
-    target_size: Optional[Tuple[int, int]] = None,
+    max_image_height: int = 224,
+    patch_size: int = 16,
     image_transform: Optional[Callable[[dict], torch.Tensor]] = None,
     batch_size: int = 64,
     num_workers: int = 4,
     split: str = "val",
     shuffle: bool = False,
+    # Legacy / deprecated:
+    image_size: Optional[int] = None,
+    target_size: Optional[Tuple[int, int]] = None,
 ) -> DataLoader:
     """
     Build train or val DataLoader for linear probe evaluation (same setup as ``train_linear_probe``).
 
     Args:
-        split: ``\"train\"`` or ``\"val\"`` (uses CSV ``Train`` column).
+        class_to_idx: Composite label -> class index mapping.
+        dataset_root: Root directory of FETAL_PLANES_DB.
+        max_image_height: Shrink images taller than this (aspect preserved).
+        patch_size: Patch size used for batch padding.
+        split: ``"train"`` or ``"val"`` (uses CSV ``Train`` column).
+        image_size / target_size: **Deprecated** — ignored.
     """
-    if target_size is None:
-        target_size = (image_size, image_size)
+    _warn_legacy_kwargs(image_size=image_size, target_size=target_size)
+
     if split not in ("train", "val"):
         raise ValueError('split must be "train" or "val"')
     train_flag = split == "train"
 
-    transform = image_transform or _default_image_transform(image_size)
+    transform = image_transform or _default_image_transform(max_image_height)
     base = FetalPlanesDBDataset(
         root=dataset_root,
         images_dir=images_dir,
         csv_file=csv_file,
-        target_size=target_size,
-        transform=[T.ToTensor()],
         train=train_flag,
         class_to_idx=class_to_idx,
     )
     ds = _ClassificationDatasetWrapper(base, transform)
+    collate_fn = partial(pad_classify_collate, patch_size=int(patch_size))
     return DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
 
 
@@ -510,9 +634,10 @@ def linear_probe_gather_predictions(
     model.eval()
     y_true_list: List[np.ndarray] = []
     y_pred_list: List[np.ndarray] = []
-    for images, labels in loader:
+    for images, pad_masks, labels in loader:
         images = images.to(device)
-        logits = model(images)
+        pad_masks = pad_masks.to(device)
+        logits = model(images, pad_mask=pad_masks)
         pred = logits.argmax(dim=1).cpu().numpy()
         y_pred_list.append(pred)
         y_true_list.append(labels.cpu().numpy())

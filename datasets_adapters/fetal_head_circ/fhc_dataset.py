@@ -4,11 +4,13 @@ Loads grayscale ultrasound images with configurable transformations.
 """
 
 import os
+import warnings
+
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-from typing import List, Optional, Callable
+from typing import Any, List, Optional, Callable
 from pathlib import Path
 import torchvision.transforms as transforms
 
@@ -26,32 +28,44 @@ except ImportError:
 class FetalHeadCircDataset(Dataset):
     """
     Dataset class for Fetal Head Circumference grayscale ultrasound images.
-    
+
+    Images are returned at their **native** resolution as grayscale tensors
+    ``[1, H, W]``. Sizing / padding is no longer done here: the MAE pipeline
+    applies :func:`embeddings.vit.train.apply_max_height_shrink` and then
+    batches via :func:`embeddings.vit.train.mae_pad_collate`, which together
+    cover shrinking to a max height and padding to a ``patch_size`` multiple.
+
     Dataset structure:
         images_dir/
             <filename>.png
             <filename>_Annotation.png (for training set only)
         csv_file contains: filename, pixel size, head circumference (mm)
-    
+
     Args:
         images_dir: Directory containing images (train or test folder)
         csv_file: Path to CSV file with metadata
-        transform: List of transformation functions to apply (default: resize_with_pad)
-        target_size: Target size for resize_with_pad (default: (224, 224))
+        transform: Optional list of callables composed into a single transform.
+                   When ``None``, just :class:`torchvision.transforms.ToTensor`.
         load_annotations: Whether to load annotation images (default: True for training)
     """
-    
+
     def __init__(
         self,
         images_dir: str,
         csv_file: str,
         transform: Optional[List[Callable]] = None,
-        target_size: tuple = (224, 224),
-        load_annotations: bool = True
+        load_annotations: bool = True,
+        target_size: Optional[Any] = None,  # deprecated, ignored
     ):
+        if target_size is not None:
+            warnings.warn(
+                "FetalHeadCircDataset(target_size=...) is deprecated and ignored: "
+                "images are now returned at their native resolution and sized by "
+                "the MAE pipeline (apply_max_height_shrink + mae_pad_collate).",
+                DeprecationWarning, stacklevel=2,
+            )
         self.images_dir = Path(images_dir)
         self.csv_file = Path(csv_file)
-        self.target_size = target_size
         self.load_annotations = load_annotations
         
         # Validate paths
@@ -114,32 +128,13 @@ class FetalHeadCircDataset(Dataset):
             annotation_count = sum(1 for p in self.annotation_paths if p is not None)
             print(f"Found {annotation_count} annotation images")
         
-        # Set up transforms
+        # Default: just convert PIL → [1, H, W] tensor at native resolution.
+        # Any size normalisation (shrink to max height, pad to patch multiple)
+        # is done downstream by the MAE pipeline.
         if transform is None:
-            # Default: resize_with_pad with zero padding
-            self.transform = self._get_default_transforms()
+            self.transform = transforms.ToTensor()
         else:
             self.transform = transforms.Compose(transform) if transform else None
-    
-    def _get_default_transforms(self) -> transforms.Compose:
-        """
-        Get default transforms: resize with aspect ratio preserved and zero padding.
-        """
-        from embeddings.vit.train import resize_keep_aspect_pad
-
-        size = self.target_size[0]  # assumes square (H, W) e.g. (224, 224)
-
-        def resize_pad_transform(img: torch.Tensor) -> torch.Tensor:
-            return resize_keep_aspect_pad(
-                img,
-                size=size,
-                interpolation=transforms.InterpolationMode.BILINEAR,
-            )
-
-        return transforms.Compose([
-            transforms.ToTensor(),  # Convert to tensor [1, H, W] for grayscale
-            transforms.Lambda(resize_pad_transform),
-        ])
     
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -166,8 +161,8 @@ class FetalHeadCircDataset(Dataset):
             image = Image.open(image_path).convert('L')  # 'L' mode for grayscale
         except Exception as e:
             print(f"Error loading image {image_path}: {e}")
-            # Return a black image as fallback
-            image = Image.new('L', self.target_size, color=0)
+            # Tiny black fallback; downstream code will pad to a patch multiple.
+            image = Image.new('L', (16, 16), color=0)
         
         # Load annotation if available
         annotation = None

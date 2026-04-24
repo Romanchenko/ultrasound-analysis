@@ -117,8 +117,13 @@ class _ViTFeatureWrapper(nn.Module):
 
     1. Accepts ``[B, C, H, W]`` input (handles both 1-ch and 3-ch by
        converting to grayscale if needed).
-    2. Resizes to the model's expected ``image_size`` if necessary.
-    3. Returns ``[B, embed_dim, 1, 1]`` so the downstream ``view(B, -1)``
+    2. If the model defines ``max_image_height`` and the input exceeds it,
+       shrinks aspect-preservingly so the height equals ``max_image_height``
+       (never upscales, never stretches, never letterboxes to a fixed width).
+    3. Zero-pads on the right / bottom so both spatial sides are multiples of
+       ``patch_size``, and supplies a ``pad_mask`` to the encoder so the
+       padded patches are excluded from attention.
+    4. Returns ``[B, embed_dim, 1, 1]`` so the downstream ``view(B, -1)``
        flattening produces ``[B, embed_dim]`` — consistent with the
        ResNet-50 feature extractors.
     """
@@ -126,23 +131,38 @@ class _ViTFeatureWrapper(nn.Module):
     def __init__(self, mae_model):
         super().__init__()
         self.mae = mae_model
-        self.image_size = mae_model.image_size
+        self.patch_size = int(mae_model.patch_size)
+        self.max_image_height = mae_model.max_image_height
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Handle RGB input (from prepare_image_transform) → grayscale
         if x.size(1) == 3:
-            # ITU-R BT.601 luminance weights
             x = 0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3]
 
-        # Resize if needed
-        if x.size(2) != self.image_size or x.size(3) != self.image_size:
+        B, C, H, W = x.shape
+
+        if self.max_image_height and H > self.max_image_height:
+            new_h = int(self.max_image_height)
+            new_w = max(1, int(round(W * new_h / H)))
             x = torch.nn.functional.interpolate(
-                x, size=(self.image_size, self.image_size),
-                mode='bilinear', align_corners=False,
+                x, size=(new_h, new_w),
+                mode='bilinear', align_corners=False, antialias=True,
             )
 
-        emb = self.mae.encode(x)          # [B, embed_dim]
+        _, _, H2, W2 = x.shape
+        p = self.patch_size
+        Hp = ((H2 + p - 1) // p) * p
+        Wp = ((W2 + p - 1) // p) * p
+        if Hp != H2 or Wp != W2:
+            padded = x.new_zeros(B, C, Hp, Wp)
+            padded[:, :, :H2, :W2] = x
+            pad_mask = torch.ones(B, 1, Hp, Wp, dtype=torch.bool, device=x.device)
+            pad_mask[:, :, :H2, :W2] = False
+            x = padded
+        else:
+            pad_mask = None
+
+        emb = self.mae.encode(x, pad_mask=pad_mask)  # [B, embed_dim]
         return emb.unsqueeze(-1).unsqueeze(-1)  # [B, embed_dim, 1, 1]
 
 
@@ -164,9 +184,24 @@ def _get_ultrasound_vit(weights_path: str, device: torch.device) -> nn.Module:
             f"Make sure it was saved with embeddings.vit.train.save_checkpoint()."
         )
 
-    config = ckpt['model_config']
+    config = dict(ckpt['model_config'])
+    # Legacy → new key names: old checkpoints stored a fixed canvas as
+    # (image_height, image_width) or image_size. Re-interpret the height as
+    # the new ``max_image_height`` cap and drop the width.
+    if 'max_image_height' not in config:
+        if 'image_height' in config:
+            config['max_image_height'] = int(config.pop('image_height'))
+        elif 'image_size' in config:
+            sz = config.pop('image_size')
+            config['max_image_height'] = (
+                int(sz) if isinstance(sz, int) else int(max(int(sz[0]), int(sz[1])))
+            )
+    config.pop('image_width', None)
+    config.pop('image_size', None)
+    config.pop('pixel_min', None)
+    config.pop('pixel_max', None)
     mae_model = create_mae_vit(**config)
-    mae_model.load_state_dict(ckpt['model_state_dict'])
+    mae_model.load_state_dict(ckpt['model_state_dict'], strict=False)
 
     wrapper = _ViTFeatureWrapper(mae_model)
     wrapper.eval()

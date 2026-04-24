@@ -22,16 +22,14 @@ Links:
 - https://zenodo.org/records/14597550
 """
 
+import warnings
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as T
-
-from embeddings.vit.train import resize_keep_aspect_pad
 
 
 SplitName = Literal["training", "validation", "testing", "train", "val", "test"]
@@ -52,6 +50,12 @@ class FOCUSDataset(Dataset):
     """
     FOCUS dataset for fetal four-chamber ultrasound images.
 
+    Images are returned at their **native** resolution. The MAE pipeline takes
+    care of the max-height shrink + per-batch padding
+    (:func:`embeddings.vit.train.apply_max_height_shrink`,
+    :func:`embeddings.vit.train.mae_pad_collate`), so this dataset performs no
+    sizing transforms of its own.
+
     Use for:
     - **Embeddings (MAE)**: load_masks=False, returns {'image': [1,H,W]}
     - **Segmentation**: load_masks=True, returns {'image': [1,H,W], 'mask': [C,H,W]}
@@ -62,10 +66,11 @@ class FOCUSDataset(Dataset):
         load_masks: If True, load segmentation masks from annfiles_mask/
         mask_target: 'cardiac', 'thorax', or 'both'.
                      'both' returns mask [2,H,W] with cardiac in ch0, thorax in ch1.
-        transform: Optional transform. If None, uses default resize to target_size.
-                   When load_masks=True, transform receives dict with 'image' and 'mask'
-                   and must return dict with same keys.
-        target_size: (H, W) for resize. Default (224, 224).
+        transform: Optional callable. If ``None``, the image is returned as a
+                   grayscale ``[1, H, W]`` tensor (via ``ToTensor``) with no
+                   resizing. When ``load_masks=True``, the transform receives a
+                   dict with ``'image'`` and ``'mask'`` and must return a dict
+                   with the same keys.
         images_dir: Name of images subdir within each split (default 'images')
         masks_dir: Name of masks subdir (default 'annfiles_mask')
     """
@@ -77,16 +82,22 @@ class FOCUSDataset(Dataset):
         *,
         load_masks: bool = False,
         mask_target: MaskTarget = "both",
-        transform: Optional[T.Compose] = None,
-        target_size: Tuple[int, int] = (224, 224),
+        transform: Optional[Callable] = None,
         images_dir: str = "images",
         masks_dir: str = "annfiles_mask",
+        target_size: Optional[Any] = None,  # deprecated, ignored
     ):
+        if target_size is not None:
+            warnings.warn(
+                "FOCUSDataset(target_size=...) is deprecated and ignored: "
+                "images are now returned at their native resolution and sized by "
+                "the MAE pipeline (apply_max_height_shrink + mae_pad_collate).",
+                DeprecationWarning, stacklevel=2,
+            )
         self.root = Path(root)
         self.split_dir = _SPLIT_DIR_MAP[split]
         self.load_masks = load_masks
         self.mask_target = mask_target
-        self.target_size = target_size
         self.images_dir_name = images_dir
         self.masks_dir_name = masks_dir
 
@@ -141,50 +152,30 @@ class FOCUSDataset(Dataset):
         else:
             self.transform = self._get_default_transform()
 
-    def _get_default_transform(self):
-        """Default: resize image (and mask) to target_size, aspect-ratio preserved."""
-        size = self.target_size[0]
+    def _get_default_transform(self) -> Callable:
+        """Default transform: PIL grayscale → ``[1, H, W]`` tensor, no resizing.
+
+        When ``load_masks=True`` the dataset builds the masks itself (already
+        ``[C, H, W]`` tensors at native resolution) and the default transform
+        just normalises the image to a single-channel float tensor.
+        """
+        def _to_grayscale_tensor(img) -> torch.Tensor:
+            if not isinstance(img, torch.Tensor):
+                img = T.ToTensor()(img)
+            if img.dim() == 2:
+                img = img.unsqueeze(0)
+            if img.size(0) > 1:
+                img = img.mean(dim=0, keepdim=True)
+            return img
 
         if self.load_masks:
-
             def transform_fn(sample: Dict) -> Dict:
-                img = sample["image"]
-                mask = sample["mask"]
-                if not isinstance(img, torch.Tensor):
-                    img = T.ToTensor()(img)
-                if img.dim() == 2:
-                    img = img.unsqueeze(0)
-                if img.size(0) > 1:
-                    img = img.mean(dim=0, keepdim=True)
-                img = resize_keep_aspect_pad(
-                    img, size, interpolation=T.InterpolationMode.BILINEAR
-                )
-                # Resize mask with nearest to preserve labels
-                if mask.dim() == 2:
-                    mask = mask.unsqueeze(0)
-                new_h, new_w = img.shape[1], img.shape[2]
-                mask = F.interpolate(
-                    mask.unsqueeze(0).float(),
-                    size=(new_h, new_w),
-                    mode="nearest",
-                ).squeeze(0)
-                return {"image": img, "mask": mask}
-
+                return {
+                    "image": _to_grayscale_tensor(sample["image"]),
+                    "mask": sample["mask"],
+                }
             return transform_fn
-        else:
-
-            def resize_img(img) -> torch.Tensor:
-                if not isinstance(img, torch.Tensor):
-                    img = T.ToTensor()(img)
-                if img.dim() == 2:
-                    img = img.unsqueeze(0)
-                if img.size(0) > 1:
-                    img = img.mean(dim=0, keepdim=True)
-                return resize_keep_aspect_pad(
-                    img, size, interpolation=T.InterpolationMode.BILINEAR
-                )
-
-            return resize_img
+        return _to_grayscale_tensor
 
     def __len__(self) -> int:
         return len(self.image_paths)

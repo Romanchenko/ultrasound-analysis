@@ -112,7 +112,7 @@ class AbdominalSegmentationDataset(Dataset):
                 if img.dim() == 3 and img.size(0) > 1:
                     img = img.mean(dim=0, keepdim=True)
                 img = resize_keep_aspect_pad(
-                    img, size, interpolation=T.InterpolationMode.BILINEAR
+                    img, size, size, interpolation=T.InterpolationMode.BILINEAR
                 )
                 if mask.dim() == 2:
                     mask = mask.unsqueeze(0)
@@ -135,7 +135,7 @@ class AbdominalSegmentationDataset(Dataset):
                 if img.dim() == 3 and img.size(0) > 1:
                     img = img.mean(dim=0, keepdim=True)
                 return resize_keep_aspect_pad(
-                    img, size, interpolation=T.InterpolationMode.BILINEAR
+                    img, size, size, interpolation=T.InterpolationMode.BILINEAR
                 )
 
             return resize_img

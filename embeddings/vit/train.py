@@ -14,7 +14,7 @@ Usage (notebook)::
         dataset=ds,
         epochs=100,
         batch_size=64,
-        image_size=224,
+        max_image_height=512,
         checkpoint_dir="experiments/checkpoints/mae",
     )
     # history: train_loss, val_loss, lr per epoch. With checkpoint_dir set,
@@ -27,15 +27,26 @@ returns either:
 * a dict with an ``'image'`` key containing a ``[1, H, W]`` grayscale tensor, or
 * a plain ``[1, H, W]`` grayscale tensor.
 
-Images are resized to ``image_size × image_size`` on the fly with
-ultrasound-appropriate augmentations (random crop, flip, small rotation).
+Content is **never stretched** and **never letterboxed** to a fixed canvas.
+Images whose height exceeds ``max_image_height`` are shrunk (aspect ratio
+preserved) so that the new height equals ``max_image_height``; smaller images
+are left untouched. Width is whatever aspect ratio produces — e.g. with
+``max_image_height = 512``, an input of ``(H=1024, W=100)`` becomes
+``(512, 50)`` and ``(H=500, W=500)`` stays ``(500, 500)``.
+
+Because samples in a batch can now have different shapes, a custom collate
+function (:func:`mae_pad_collate`) zero-pads each batch to the per-batch
+maximum height / width, rounded up to the nearest multiple of ``patch_size``,
+and emits a ``pad_mask`` marking the padded pixels so the model excludes
+them from attention / loss.
 """
 
 import json
 import math
 import os
+import random
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -47,34 +58,87 @@ from tqdm import tqdm
 from embeddings.vit.model import MaskedAutoencoderViT, create_mae_vit
 
 
-def resize_keep_aspect_pad(
+def apply_max_height_shrink(
     img: torch.Tensor,
-    size: int,
+    max_image_height: Optional[int],
     interpolation: T.InterpolationMode = T.InterpolationMode.BILINEAR,
 ) -> torch.Tensor:
     """
-    Resize image to fit within size x size, keeping aspect ratio.
-    Zero-pad on shorter sides to produce a square output.
+    Only **shrinks** tall images. If the current height is at most
+    ``max_image_height``, returns *img* unchanged. If it is **greater**, resizes
+    so the new height is ``max_image_height`` and the width is scaled to keep
+    aspect ratio. Never upscales.
+
+    When *max_image_height* is ``None`` or not positive, returns *img* unchanged.
     """
-    padded, _ = resize_keep_aspect_pad_with_mask(img, size, interpolation)
+    if max_image_height is None or max_image_height <= 0:
+        return img
+    _, h, w = img.shape
+    if h <= max_image_height:
+        return img
+    new_w = max(1, int(round(w * max_image_height / h)))
+    return T.functional.resize(
+        img,
+        [int(max_image_height), new_w],
+        interpolation=interpolation,
+        antialias=True,
+    )
+
+
+def pad_to_patch_multiple(
+    img: torch.Tensor, patch_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Zero-pad ``[C, H, W]`` on the right / bottom so that both spatial sides are
+    multiples of *patch_size*. Returns ``(padded, pad_mask)`` where ``pad_mask``
+    is ``[1, H', W']`` boolean (True on padded pixels).
+    """
+    if img.dim() != 3:
+        raise ValueError(f"pad_to_patch_multiple expects [C, H, W], got shape {tuple(img.shape)}")
+    _, h, w = img.shape
+    H = math.ceil(h / patch_size) * patch_size
+    W = math.ceil(w / patch_size) * patch_size
+    padded = T.functional.pad(img, [0, 0, W - w, H - h], fill=0)
+    pad_mask = torch.ones(1, H, W, dtype=torch.bool)
+    pad_mask[:, :h, :w] = False
+    return padded, pad_mask
+
+
+def resize_keep_aspect_pad(
+    img: torch.Tensor,
+    image_height: int,
+    image_width: int,
+    interpolation: T.InterpolationMode = T.InterpolationMode.BILINEAR,
+) -> torch.Tensor:
+    """
+    :func:`apply_max_height_shrink` if needed, then letterbox into
+    ``image_height × image_width`` (aspect ratio preserved, zero padding; no stretch).
+    """
+    padded, _ = resize_keep_aspect_pad_with_mask(
+        img, image_height, image_width, interpolation=interpolation,
+    )
     return padded
 
 
 def resize_keep_aspect_pad_with_mask(
     img: torch.Tensor,
-    size: int,
+    image_height: int,
+    image_width: int,
     interpolation: T.InterpolationMode = T.InterpolationMode.BILINEAR,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Resize image to fit within size x size, keeping aspect ratio.
-    Zero-pad on shorter sides to produce a square output.
+    If the image is taller than *image_height*, shrinks to that height; then
+    **letterboxes** into ``image_height × image_width`` (content scaled uniformly
+    to **fit inside** the box, bars only — original aspect is preserved).
 
     Returns:
-        padded_img: ``[C, size, size]``
-        pad_mask:   ``[1, size, size]`` boolean, True where pixel is padding.
+        padded_img: ``[C, image_height, image_width]``
+        pad_mask:   ``[1, image_height, image_width]`` boolean, True where padding.
     """
+    img = apply_max_height_shrink(img, image_height, interpolation=interpolation)
+    th, tw = int(image_height), int(image_width)
     _, h, w = img.shape
-    scale = min(size / h, size / w)
+    scale = min(th / h, tw / w)
     new_h = int(round(h * scale))
     new_w = int(round(w * scale))
     resized = T.functional.resize(
@@ -82,8 +146,8 @@ def resize_keep_aspect_pad_with_mask(
         interpolation=interpolation,
         antialias=True,
     )
-    pad_h = size - new_h
-    pad_w = size - new_w
+    pad_h = th - new_h
+    pad_w = tw - new_w
     pad_top = pad_h // 2
     pad_bottom = pad_h - pad_top
     pad_left = pad_w // 2
@@ -92,7 +156,7 @@ def resize_keep_aspect_pad_with_mask(
         resized, [pad_left, pad_top, pad_right, pad_bottom], fill=0
     )
 
-    pad_mask = torch.ones(1, size, size, dtype=torch.bool)
+    pad_mask = torch.ones(1, th, tw, dtype=torch.bool)
     pad_mask[:, pad_top:pad_top + new_h, pad_left:pad_left + new_w] = False
     return padded, pad_mask
 
@@ -105,47 +169,27 @@ class MAEAugmentation(nn.Module):
     """
     Ultrasound-appropriate augmentations for MAE pre-training.
 
-    Operates on an already-resized ``[1, image_size, image_size]`` tensor
-    (after ``resize_keep_aspect_pad``).  Applies flip, small rotation,
-    and Gaussian blur.  **No** ``RandomResizedCrop`` — that would
-    destroy the known padding layout.
-
-    When a ``pad_mask`` is given, all geometric transforms are applied to
-    both the image and the mask so they stay aligned.
+    Operates on a (height-capped) ``[1, H, W]`` tensor (no letterbox). Applies
+    horizontal flip; optional rotation and Gaussian blur are wired up but
+    currently disabled. No ``RandomResizedCrop`` — keep the content honest so
+    the pad-mask produced by :func:`mae_pad_collate` stays meaningful.
     """
 
-    def __init__(self, image_size: int = 224):
+    def __init__(self) -> None:
         super().__init__()
-        self.image_size = image_size
         self.flip = T.RandomHorizontalFlip(p=0.5)
         self.rotation = T.RandomApply([T.RandomRotation(degrees=15)], p=0.3)
         self.blur = T.RandomApply(
             [T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.2,
         )
 
-    def __call__(
-        self,
-        img: torch.Tensor,
-        pad_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
         if img.dim() == 2:
             img = img.unsqueeze(0)
-
-        if pad_mask is not None:
-            # Stack so geometric transforms apply identically to both
-            combined = torch.cat([img, pad_mask.float()], dim=0)  # [2, H, W]
-            combined = self.flip(combined)
-            # combined = self.rotation(combined)
-            img = combined[:1]
-            pad_mask = combined[1:] > 0.5  # back to bool [1, H, W]
-
-            # img = self.blur(img)
-        else:
-            img = self.flip(img)
-            # img = self.rotation(img)
-            # img = self.blur(img)
-
-        return img, pad_mask
+        img = self.flip(img)
+        # img = self.rotation(img)
+        # img = self.blur(img)
+        return img
 
 
 def _extract_image(sample: Any) -> torch.Tensor:
@@ -173,35 +217,64 @@ class MAETrainTransform:
     Full transform applied to raw dataset samples before feeding to MAE.
 
     1. Extract / normalise to ``[1, H, W]``.
-    2. ``resize_keep_aspect_pad_with_mask`` → ``(image, pad_mask)``.
-    3. Apply augmentations (flip, rotation, blur) keeping pad_mask aligned.
+    2. :func:`apply_max_height_shrink` — shrink if height exceeds
+       ``max_image_height`` (aspect kept); never upscale / stretch / pad.
+    3. Apply augmentations (flip).
+
+    Returns a single ``[1, H', W']`` tensor of **variable** shape. Per-batch
+    padding is handled by :func:`mae_pad_collate`.
     """
 
-    def __init__(self, image_size: int = 224):
-        self.augmentation = MAEAugmentation(image_size)
-        self.image_size = image_size
+    def __init__(self, max_image_height: int = 224):
+        self.max_image_height = int(max_image_height)
+        self.augmentation = MAEAugmentation()
 
-    def __call__(self, sample: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(self, sample: Any) -> torch.Tensor:
         image = _extract_image(sample)
-        image, pad_mask = resize_keep_aspect_pad_with_mask(
-            image, self.image_size,
-        )
-        image, pad_mask = self.augmentation(image, pad_mask)
-        return image, pad_mask
+        image = apply_max_height_shrink(image, self.max_image_height)
+        image = self.augmentation(image)
+        return image
 
 
 class MAEValTransform:
-    """Validation transform: resize + pad, no augmentations. Returns ``(image, pad_mask)``."""
+    """Validation transform: only the max-height shrink, no augmentations."""
 
-    def __init__(self, image_size: int = 224):
-        self.image_size = image_size
+    def __init__(self, max_image_height: int = 224):
+        self.max_image_height = int(max_image_height)
 
-    def __call__(self, sample: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(self, sample: Any) -> torch.Tensor:
         image = _extract_image(sample)
-        image, pad_mask = resize_keep_aspect_pad_with_mask(
-            image, self.image_size,
-        )
-        return image, pad_mask
+        return apply_max_height_shrink(image, self.max_image_height)
+
+
+def mae_pad_collate(
+    batch: List[torch.Tensor], patch_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Collate variable-shape ``[1, H_i, W_i]`` images into a single batch.
+
+    The batch is zero-padded (right and bottom only) to ``(max_h, max_w)``,
+    each rounded **up** to a multiple of ``patch_size``. Returns
+    ``(images, pad_masks)``:
+
+    * ``images``:    ``[B, C, H', W']`` float
+    * ``pad_masks``: ``[B, 1, H', W']`` boolean, True where the pixel is padding.
+    """
+    if len(batch) == 0:
+        raise ValueError("mae_pad_collate received an empty batch.")
+    C = batch[0].shape[0]
+    max_h = max(int(img.shape[-2]) for img in batch)
+    max_w = max(int(img.shape[-1]) for img in batch)
+    H = math.ceil(max_h / patch_size) * patch_size
+    W = math.ceil(max_w / patch_size) * patch_size
+    B = len(batch)
+    images = torch.zeros(B, C, H, W, dtype=batch[0].dtype)
+    pad_masks = torch.ones(B, 1, H, W, dtype=torch.bool)
+    for i, img in enumerate(batch):
+        _, h, w = img.shape
+        images[i, :, :h, :w] = img
+        pad_masks[i, :, :h, :w] = False
+    return images, pad_masks
 
 
 # =====================================================================
@@ -211,7 +284,8 @@ class MAEValTransform:
 class _MAEDatasetWrapper(Dataset):
     """Wraps any dataset and applies the MAE transform.
 
-    Each item is a ``(image, pad_mask)`` tuple.
+    Each item is a ``[1, H, W]`` image tensor (variable shape). Padding into a
+    fixed-shape batch is handled by :func:`mae_pad_collate`.
     """
 
     def __init__(self, base_dataset: Dataset, transform):
@@ -317,6 +391,61 @@ def _validate(
     return total_loss / max(num_batches, 1)
 
 
+def _save_train_transform_previews(
+    train_dataset: Dataset,
+    patch_size: int,
+    out_dir: str,
+    epoch_1based: int,
+    num_samples: int,
+) -> None:
+    """Random training samples *after* MAE transform; also shows the pad-mask that
+    :func:`mae_pad_collate` would produce when batching this single sample
+    (padding to the next ``patch_size`` multiple). Saves a PNG in *out_dir*."""
+    if num_samples <= 0:
+        return
+    n = len(train_dataset)
+    if n == 0:
+        return
+    k = min(int(num_samples), n)
+    indices = random.sample(range(n), k)
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(k, 2, figsize=(7, 2.1 * k), squeeze=False)
+    for row, idx in enumerate(indices):
+        image = train_dataset[idx]
+        padded, pad_mask = pad_to_patch_multiple(image, patch_size)
+        im = padded.detach().float().cpu().numpy().squeeze(0)
+        ax0 = axes[row, 0]
+        ax0.imshow(im, cmap="gray", vmin=0, vmax=1)
+        ax0.set_title(
+            f"idx {idx} — image {tuple(image.shape[-2:])} → pad {tuple(padded.shape[-2:])}",
+            fontsize=9,
+        )
+        ax0.axis("off")
+        ax1 = axes[row, 1]
+        ax1.imshow(
+            pad_mask.detach().float().cpu().numpy().squeeze(0),
+            cmap="cividis", vmin=0, vmax=1,
+        )
+        ax1.set_title("pad mask (1 = padded)", fontsize=9)
+        ax1.axis("off")
+    fig.suptitle(
+        f"MAE training pipeline — after transforms (epoch {epoch_1based})",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    out_path = os.path.join(
+        out_dir, f"mae_train_transform_preview_epoch{epoch_1based:04d}.png"
+    )
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → train transform preview: {out_path}")
+
+
 # =====================================================================
 # Checkpointing
 # =====================================================================
@@ -335,7 +464,7 @@ def save_checkpoint(
 
     # Persist model config so we can re-create the architecture later
     model_config = {
-        'image_size': model.image_size,
+        'max_image_height': model.max_image_height,
         'patch_size': model.patch_size,
         'in_channels': model.in_channels,
         'embed_dim': model.embed_dim,
@@ -386,8 +515,30 @@ def load_checkpoint(
     config.pop('pixel_max', None)
     config.setdefault('l1_loss_weight', 0.0)
     config.setdefault('l2_loss_weight', 1.0)
+    # Legacy: older checkpoints stored a fixed letterbox canvas
+    # (image_height, image_width or image_size). Re-interpret the height as
+    # the new ``max_image_height`` cap and drop the width (no longer used).
+    if 'max_image_height' not in config:
+        if 'image_height' in config:
+            config['max_image_height'] = int(config.pop('image_height'))
+        elif 'image_size' in config:
+            sz = config.pop('image_size')
+            if isinstance(sz, int):
+                config['max_image_height'] = int(sz)
+            else:
+                config['max_image_height'] = int(max(int(sz[0]), int(sz[1])))
+    config.pop('image_width', None)
+    config.pop('image_size', None)
     model = create_mae_vit(**config)
-    model.load_state_dict(ckpt['model_state_dict'])
+    bad = model.load_state_dict(ckpt['model_state_dict'], strict=False)
+    if bad.missing_keys or bad.unexpected_keys:
+        import warnings
+        warnings.warn(
+            f"Checkpoint loaded with strict=False: "
+            f"{len(bad.missing_keys)} missing, {len(bad.unexpected_keys)} unexpected keys. "
+            f"(Expected when moving from fixed-canvas PE to variable-shape RoPE.)",
+            stacklevel=2,
+        )
     model.eval()
     model.to(device)
 
@@ -400,7 +551,7 @@ def mae_model_summary(model: MaskedAutoencoderViT) -> Dict[str, Any]:
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return {
-        'image_size': model.image_size,
+        'max_image_height': model.max_image_height,
         'patch_size': model.patch_size,
         'in_channels': model.in_channels,
         'embed_dim': model.embed_dim,
@@ -488,7 +639,6 @@ def visualize_reconstruction(
         sample_indices: Fixed dataset indices to use. If ``None``, random
             indices are chosen. Providing fixed indices makes the
             visualisation reproducible across epochs / runs.
-
     Works in both Jupyter notebooks and script environments.
     """
     import matplotlib.pyplot as plt
@@ -498,7 +648,7 @@ def visualize_reconstruction(
 
     model.eval()
 
-    val_tf = MAEValTransform(model.image_size)
+    val_tf = MAEValTransform(model.max_image_height or 0)
 
     if sample_indices is not None:
         indices = sample_indices[:num_samples]
@@ -511,7 +661,8 @@ def visualize_reconstruction(
         axes = axes[None, :]
 
     for i, idx in enumerate(indices):
-        img, pad_mask_px = val_tf(dataset[int(idx)])
+        img = val_tf(dataset[int(idx)])
+        img, pad_mask_px = pad_to_patch_multiple(img, model.patch_size)
         img = img.unsqueeze(0).to(device)
         pad_mask_px = pad_mask_px.unsqueeze(0).to(device)
 
@@ -523,8 +674,11 @@ def visualize_reconstruction(
         patches = model.patchify(img)
         mask_expanded = mask.unsqueeze(-1).expand_as(patches)
 
+        grid_h = img.shape[-2] // model.patch_size
+        grid_w = img.shape[-1] // model.patch_size
+
         masked_patches = patches * (1 - mask_expanded)
-        masked_img = model.unpatchify(masked_patches)
+        masked_img = model.unpatchify(masked_patches, grid_h, grid_w)
 
         pred_pixels = pred
         if model.norm_pix_loss:
@@ -533,7 +687,7 @@ def visualize_reconstruction(
             pred_pixels = pred * (var + 1e-6).sqrt() + mean
 
         hybrid_patches = patches * (1 - mask_expanded) + pred_pixels * mask_expanded
-        hybrid_img = model.unpatchify(hybrid_patches)
+        hybrid_img = model.unpatchify(hybrid_patches, grid_h, grid_w)
 
         def _to_np(t):
             return t.squeeze().cpu().numpy().clip(0, 1)
@@ -567,8 +721,8 @@ def visualize_reconstruction(
 
 def train_mae(
     dataset: Dataset,
-    # --- model ---
-    image_size: int = 224,
+    # --- model / transforms ---
+    max_image_height: int = 224,
     patch_size: int = 16,
     embed_dim: int = 384,
     depth: int = 6,
@@ -596,6 +750,7 @@ def train_mae(
     # --- checkpointing ---
     checkpoint_dir: Optional[str] = None,
     save_every: int = 10,
+    train_transform_preview: int = 4,
     # --- device ---
     device: Optional[torch.device] = None,
     # --- resume ---
@@ -612,7 +767,11 @@ def train_mae(
     Args:
         dataset:          Any ``torch.utils.data.Dataset`` returning
                           grayscale image tensors (or dicts with ``'image'``).
-        image_size:       Input image size (square).
+        max_image_height: **Cap** on per-image height. Images taller are shrunk
+                          to this (aspect preserved, no upscale); smaller images
+                          pass through untouched. Must be divisible by
+                          ``patch_size``. Content is **never** stretched and
+                          **never** letterboxed to a fixed width.
         patch_size:       Patch side length.
         embed_dim:        Encoder embedding dimension.
         depth:            Encoder depth.
@@ -636,6 +795,11 @@ def train_mae(
         num_workers:      DataLoader workers.
         checkpoint_dir:   Where to save checkpoints.  ``None`` = no saving.
         save_every:       Save a checkpoint every N epochs.
+        train_transform_preview: How many **random** training samples to plot (after
+                          all transforms) each time a checkpoint is written; set to ``0`` to
+                          disable. Only runs when *checkpoint_dir* is set. PNGs are saved
+                          next to checkpoints as
+                          ``mae_train_transform_preview_epoch{epoch}.png``.
         device:           Training device (auto-detected when None).
         resume_from:      Path to a checkpoint to resume training from.
         results_json:     If set, write run summary (model, training, loss/lr per epoch) to this path.
@@ -654,6 +818,13 @@ def train_mae(
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if max_image_height <= 0:
+        raise ValueError("max_image_height must be positive.")
+    if max_image_height % patch_size != 0:
+        raise ValueError(
+            f"max_image_height must be divisible by patch_size; "
+            f"got max_image_height={max_image_height}, patch_size={patch_size}."
+        )
     print(f"Training on: {device}")
 
     # ---- split dataset ----
@@ -666,21 +837,31 @@ def train_mae(
     print(f"Train: {n_train} samples | Val: {n_val} samples")
 
     # ---- wrap with transforms ----
-    train_ds = _MAEDatasetWrapper(train_ds, MAETrainTransform(image_size))
-    val_ds = _MAEDatasetWrapper(val_ds, MAEValTransform(image_size))
+    train_ds = _MAEDatasetWrapper(
+        train_ds,
+        MAETrainTransform(max_image_height=max_image_height),
+    )
+    val_ds = _MAEDatasetWrapper(
+        val_ds, MAEValTransform(max_image_height=max_image_height),
+    )
+
+    def _collate(batch: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        return mae_pad_collate(batch, patch_size)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
+        collate_fn=_collate,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
+        collate_fn=_collate,
     )
 
     # ---- model ----
     model = create_mae_vit(
-        image_size=image_size,
+        max_image_height=max_image_height,
         patch_size=patch_size,
         in_channels=1,
         embed_dim=embed_dim,
@@ -706,7 +887,7 @@ def train_mae(
     print(f"Model parameters: {n_params:,} total | {n_enc:,} encoder")
 
     training_config: Dict[str, Any] = {
-        'image_size': image_size,
+        'max_image_height': max_image_height,
         'patch_size': patch_size,
         'embed_dim': embed_dim,
         'depth': depth,
@@ -731,6 +912,7 @@ def train_mae(
         'num_workers': num_workers,
         'checkpoint_dir': checkpoint_dir,
         'save_every': save_every,
+        'train_transform_preview': train_transform_preview,
         'resume_from': resume_from,
         'n_train_samples': n_train,
         'n_val_samples': n_val,
@@ -803,7 +985,7 @@ def train_mae(
         if on_epoch_end is not None:
             on_epoch_end(epoch, history, model)
 
-        # ---- checkpoint ----
+        # ---- checkpoint + optional transform preview (same cadence) ----
         if checkpoint_dir and (epoch + 1) % save_every == 0:
             path = os.path.join(checkpoint_dir, f"mae_epoch_{epoch+1}.pt")
             save_checkpoint(
@@ -811,6 +993,11 @@ def train_mae(
                 epoch, train_loss, val_loss, path,
             )
             print(f"  → checkpoint saved: {path}")
+            if train_transform_preview > 0:
+                _save_train_transform_previews(
+                    train_ds, patch_size, checkpoint_dir,
+                    epoch + 1, train_transform_preview,
+                )
 
     # ---- final checkpoint ----
     if checkpoint_dir:
