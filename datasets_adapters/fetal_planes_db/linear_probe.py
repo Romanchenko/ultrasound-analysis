@@ -135,6 +135,11 @@ class LinearProbe(nn.Module):
     The encoder is kept in eval mode and its parameters are frozen. When the
     encoder's ``.encode`` signature accepts a ``pad_mask`` kwarg, the probe
     forwards the pixel pad mask produced by :func:`pad_classify_collate`.
+
+    Features are passed through a non-affine BatchNorm before the linear head
+    (per He et al. 2022 §A.2, "Linear Probing"): frozen MAE features have
+    strongly non-uniform per-dim scales, and a parameter-free BN typically
+    lifts linear-probe accuracy several points.
     """
 
     def __init__(
@@ -145,6 +150,7 @@ class LinearProbe(nn.Module):
     ):
         super().__init__()
         self.encoder = encoder
+        self.feat_bn = nn.BatchNorm1d(embed_dim, affine=False, eps=1e-6)
         self.head = nn.Linear(embed_dim, num_classes)
         self._use_encode = hasattr(encoder, "encode")
         self._encode_supports_pad_mask = False
@@ -169,6 +175,7 @@ class LinearProbe(nn.Module):
     ) -> torch.Tensor:
         with torch.no_grad():
             emb = self._get_embeddings(x, pad_mask=pad_mask)
+        emb = self.feat_bn(emb)
         return self.head(emb)
 
 
@@ -195,9 +202,22 @@ def _apply_max_height_shrink(
     )
 
 
-def _default_image_transform(max_image_height: int) -> Callable[[dict], torch.Tensor]:
-    """Build a transform: normalise to ``[1, H, W]`` grayscale and shrink if
-    the height exceeds *max_image_height* (aspect preserved, no upscale)."""
+def _standardize_per_image(img: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Per-image z-score normalisation. Mirror of
+    :func:`embeddings.vit.train.standardize_per_image` so the probe sees the
+    same pixel distribution the encoder was trained on."""
+    mean = img.mean()
+    std = img.std().clamp_min(eps)
+    return (img - mean) / std
+
+
+def _default_image_transform(
+    max_image_height: int, standardize: bool = True,
+) -> Callable[[dict], torch.Tensor]:
+    """Build a transform: normalise to ``[1, H, W]`` grayscale, shrink if the
+    height exceeds *max_image_height* (aspect preserved, no upscale), and
+    apply per-image z-score so the probe's pixel distribution matches the
+    MAE pre-training one."""
 
     def transform(sample: dict) -> torch.Tensor:
         img = sample["image"]
@@ -208,6 +228,8 @@ def _default_image_transform(max_image_height: int) -> Callable[[dict], torch.Te
         if img.size(0) > 1:
             img = img.mean(dim=0, keepdim=True)
         img = _apply_max_height_shrink(img, max_image_height)
+        if standardize:
+            img = _standardize_per_image(img)
         return img
 
     return transform
@@ -326,7 +348,7 @@ def train_linear_probe(
     epochs: int = 50,
     batch_size: int = 64,
     lr: float = 1e-3,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 0.0,
     num_workers: int = 4,
     device: Optional[torch.device] = None,
     checkpoint_dir: Optional[str] = None,
@@ -357,7 +379,9 @@ def train_linear_probe(
         epochs: Number of training epochs.
         batch_size: Batch size.
         lr: Learning rate for the linear head.
-        weight_decay: Weight decay.
+        weight_decay: Weight decay for the linear head. Default ``0.0`` —
+                      applying WD to a linear classifier over frozen features
+                      typically hurts (MAE §A.2).
         num_workers: DataLoader workers.
         device: Device (auto-detect if None).
         checkpoint_dir: Where to save checkpoints (None = no saving).
@@ -432,6 +456,7 @@ def train_linear_probe(
     )
 
     model = LinearProbe(encoder, embed_dim, num_classes).to(device)
+    # Only the linear head is trainable (feat_bn has no learnable parameters).
     optimizer = optim.AdamW(model.head.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
 
@@ -565,7 +590,15 @@ def load_linear_probe_from_checkpoint(
     class_to_idx = ckpt["class_to_idx"]
     num_classes = len(class_to_idx)
     model = LinearProbe(encoder, embed_dim, num_classes).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # strict=False so checkpoints predating feat_bn still load.
+    bad = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if bad.missing_keys or bad.unexpected_keys:
+        warnings.warn(
+            "Linear probe checkpoint loaded with strict=False: "
+            f"{len(bad.missing_keys)} missing, {len(bad.unexpected_keys)} unexpected. "
+            "(Expected for pre-BN checkpoints — feat_bn will use init running stats.)",
+            stacklevel=2,
+        )
     model.eval()
     return model, class_to_idx
 

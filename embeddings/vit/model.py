@@ -28,6 +28,7 @@ References
 * He et al., "Masked Autoencoders Are Scalable Vision Learners", CVPR 2022.
 """
 
+import warnings
 from typing import List, Optional, Tuple
 
 import torch
@@ -338,6 +339,19 @@ class MaskedAutoencoderViT(nn.Module):
             )
         if l1_loss_weight == 0.0 and l2_loss_weight == 0.0:
             raise ValueError("At least one of l1_loss_weight or l2_loss_weight must be positive.")
+
+        # norm_pix_loss targets are per-patch z-scored (roughly [-5, +5]), which
+        # a sigmoid output cannot reach. If both flags are True, the decoder
+        # saturates and pre-training quality collapses. Auto-disable clipping.
+        if norm_pix_loss and clip_pixel_pred:
+            warnings.warn(
+                "clip_pixel_pred=True is incompatible with norm_pix_loss=True: "
+                "sigmoid output is confined to (0, 1) but per-patch normalised "
+                "targets extend outside this range, preventing the decoder from "
+                "reaching them. Disabling clip_pixel_pred for this model.",
+                stacklevel=2,
+            )
+            clip_pixel_pred = False
 
         # ---- store config for serialisation / feature_extractor ----
         self.patch_size = patch_size
@@ -747,20 +761,35 @@ class MaskedAutoencoderViT(nn.Module):
         self,
         imgs: torch.Tensor,
         pad_mask: Optional[torch.Tensor] = None,
+        pool: str = "mean",
     ) -> torch.Tensor:
         """
-        Extract CLS-token embeddings by feeding *all* patches through
-        the encoder (no masking).
+        Extract encoder embeddings by feeding *all* patches through the encoder
+        (no masking).
 
         Args:
             imgs: ``[B, C, H, W]``
             pad_mask: ``[B, 1, H, W]`` boolean (True = pad), or ``None``.
+            pool: How to reduce the encoder output to a single ``[B, embed_dim]``
+                vector:
+
+                * ``"mean"`` *(default, recommended for MAE)*: average over
+                  patch tokens, excluding padding patches when ``pad_mask`` is
+                  provided. Per He et al. 2022 (MAE, §A.2), mean-pooled patch
+                  tokens consistently outperform the CLS token on linear
+                  probe for MAE-pretrained encoders (the CLS token has no
+                  direct pre-training target and is under-trained).
+                * ``"cls"``: return the CLS token (kept for compatibility).
 
         Returns:
             ``[B, embed_dim]``
         """
+        if pool not in ("mean", "cls"):
+            raise ValueError(f"pool must be 'mean' or 'cls', got {pool!r}")
+
         x, grid_h, grid_w = self.patch_embed(imgs)       # [B, N, D]
 
+        patch_pad: Optional[torch.Tensor] = None
         if pad_mask is not None:
             patch_pad = _pixel_pad_mask_to_patch(pad_mask, self.patch_size)
             x = x * (~patch_pad).unsqueeze(-1).float()
@@ -774,7 +803,15 @@ class MaskedAutoencoderViT(nn.Module):
             x = blk(x, pos_h, pos_w)
         x = self.norm(x)
 
-        return x[:, 0]                                    # CLS token
+        if pool == "cls":
+            return x[:, 0]
+
+        # Mean pool over patch tokens, ignoring padding.
+        patches = x[:, 1:]                               # [B, N, D]
+        if patch_pad is not None:
+            keep = (~patch_pad).unsqueeze(-1).float()    # [B, N, 1]
+            return (patches * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
+        return patches.mean(dim=1)
 
     # -----------------------------------------------------------------
     # Convenience: encoder-only model for feature extraction

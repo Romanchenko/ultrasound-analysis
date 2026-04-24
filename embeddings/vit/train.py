@@ -85,6 +85,25 @@ def apply_max_height_shrink(
     )
 
 
+def standardize_per_image(
+    img: torch.Tensor, eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Per-image z-score normalisation: ``(img - mean) / std`` computed over all
+    pixels of the sample.
+
+    Ultrasound images have wildly varying dynamic range and contrast across
+    machines / acquisitions. Standardising each image removes this low-level
+    variation so the encoder can spend capacity on structure. After this
+    transform the image has mean ≈ 0 and std ≈ 1, which also makes the zeros
+    inserted by :func:`mae_pad_collate` sit at "content mean" rather than at
+    "min pixel".
+    """
+    mean = img.mean()
+    std = img.std().clamp_min(eps)
+    return (img - mean) / std
+
+
 def pad_to_patch_multiple(
     img: torch.Tensor, patch_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -220,31 +239,41 @@ class MAETrainTransform:
     2. :func:`apply_max_height_shrink` — shrink if height exceeds
        ``max_image_height`` (aspect kept); never upscale / stretch / pad.
     3. Apply augmentations (flip).
+    4. :func:`standardize_per_image` — per-image z-score so the encoder sees
+       contrast-normalised content (same normalisation is applied at
+       validation / inference / probing time).
 
     Returns a single ``[1, H', W']`` tensor of **variable** shape. Per-batch
     padding is handled by :func:`mae_pad_collate`.
     """
 
-    def __init__(self, max_image_height: int = 224):
+    def __init__(self, max_image_height: int = 224, standardize: bool = True):
         self.max_image_height = int(max_image_height)
+        self.standardize = bool(standardize)
         self.augmentation = MAEAugmentation()
 
     def __call__(self, sample: Any) -> torch.Tensor:
         image = _extract_image(sample)
         image = apply_max_height_shrink(image, self.max_image_height)
         image = self.augmentation(image)
+        if self.standardize:
+            image = standardize_per_image(image)
         return image
 
 
 class MAEValTransform:
-    """Validation transform: only the max-height shrink, no augmentations."""
+    """Validation transform: max-height shrink + per-image z-score, no augmentations."""
 
-    def __init__(self, max_image_height: int = 224):
+    def __init__(self, max_image_height: int = 224, standardize: bool = True):
         self.max_image_height = int(max_image_height)
+        self.standardize = bool(standardize)
 
     def __call__(self, sample: Any) -> torch.Tensor:
         image = _extract_image(sample)
-        return apply_max_height_shrink(image, self.max_image_height)
+        image = apply_max_height_shrink(image, self.max_image_height)
+        if self.standardize:
+            image = standardize_per_image(image)
+        return image
 
 
 def mae_pad_collate(
@@ -419,8 +448,11 @@ def _save_train_transform_previews(
         image = train_dataset[idx]
         padded, pad_mask = pad_to_patch_multiple(image, patch_size)
         im = padded.detach().float().cpu().numpy().squeeze(0)
+        # Per-image min/max scaling so standardised (mean=0, std=1) previews
+        # and raw [0, 1] previews both render with good contrast.
+        im_lo, im_hi = float(im.min()), float(im.max())
         ax0 = axes[row, 0]
-        ax0.imshow(im, cmap="gray", vmin=0, vmax=1)
+        ax0.imshow(im, cmap="gray", vmin=im_lo, vmax=im_hi)
         ax0.set_title(
             f"idx {idx} — image {tuple(image.shape[-2:])} → pad {tuple(padded.shape[-2:])}",
             fontsize=9,
@@ -689,20 +721,26 @@ def visualize_reconstruction(
         hybrid_patches = patches * (1 - mask_expanded) + pred_pixels * mask_expanded
         hybrid_img = model.unpatchify(hybrid_patches, grid_h, grid_w)
 
-        def _to_np(t):
-            return t.squeeze().cpu().numpy().clip(0, 1)
+        def _to_np(t: torch.Tensor):
+            return t.squeeze().detach().cpu().numpy()
 
-        axes[i, 0].imshow(_to_np(img), cmap='gray', vmin=0, vmax=1)
+        # Use the *original* image's pixel range to display all three panels so
+        # they're on the same scale — works whether the transform produced [0, 1]
+        # pixels or z-scored values.
+        orig_np = _to_np(img)
+        lo, hi = float(orig_np.min()), float(orig_np.max())
+
+        axes[i, 0].imshow(orig_np, cmap='gray', vmin=lo, vmax=hi)
         axes[i, 0].set_title('Original')
         axes[i, 0].axis('off')
 
-        axes[i, 1].imshow(_to_np(hybrid_img), cmap='gray', vmin=0, vmax=1)
+        axes[i, 1].imshow(_to_np(hybrid_img), cmap='gray', vmin=lo, vmax=hi)
         axes[i, 1].set_title(
             f'Reconstructed\n(loss={loss.item():.4f})'
         )
         axes[i, 1].axis('off')
 
-        axes[i, 2].imshow(_to_np(masked_img), cmap='gray', vmin=0, vmax=1)
+        axes[i, 2].imshow(_to_np(masked_img), cmap='gray', vmin=lo, vmax=hi)
         axes[i, 2].set_title(f'Masked ({mask_ratio:.0%})')
         axes[i, 2].axis('off')
 
