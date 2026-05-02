@@ -319,6 +319,7 @@ class MaskedAutoencoderViT(nn.Module):
         decoder_pred_hidden_dim: Optional[int] = None,
         l1_loss_weight: float = 0.0,
         l2_loss_weight: float = 1.0,
+        fft_loss_weight: float = 0.0,
         max_image_height: Optional[int] = None,
     ):
         super().__init__()
@@ -332,10 +333,10 @@ class MaskedAutoencoderViT(nn.Module):
                 f"decoder_embed_dim ({decoder_embed_dim}) must be divisible by "
                 f"decoder_num_heads ({decoder_num_heads})."
             )
-        if l1_loss_weight < 0 or l2_loss_weight < 0:
+        if l1_loss_weight < 0 or l2_loss_weight < 0 or fft_loss_weight < 0:
             raise ValueError(
-                f"l1_loss_weight and l2_loss_weight must be non-negative, "
-                f"got l1_loss_weight={l1_loss_weight}, l2_loss_weight={l2_loss_weight}."
+                f"Loss weights must be non-negative, got l1={l1_loss_weight}, "
+                f"l2={l2_loss_weight}, fft={fft_loss_weight}."
             )
         if l1_loss_weight == 0.0 and l2_loss_weight == 0.0:
             raise ValueError("At least one of l1_loss_weight or l2_loss_weight must be positive.")
@@ -374,6 +375,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.decoder_pred_hidden_dim = pred_hid
         self.l1_loss_weight = l1_loss_weight
         self.l2_loss_weight = l2_loss_weight
+        self.fft_loss_weight = fft_loss_weight
         self.max_image_height = (
             int(max_image_height) if max_image_height is not None else None
         )
@@ -714,6 +716,22 @@ class MaskedAutoencoderViT(nn.Module):
         l2 = (diff ** 2).mean(dim=-1)                     # [B, N]
         loss = self.l1_loss_weight * l1 + self.l2_loss_weight * l2
 
+        if self.fft_loss_weight > 0:
+            p = self.patch_size
+            B, N, _ = pred.shape
+            # Reshape to spatial [B*N, C, p, p] for 2D FFT
+            pred_s = pred.reshape(B * N, self.in_channels, p, p)
+            tgt_s  = target.reshape(B * N, self.in_channels, p, p)
+            # norm="ortho" makes the transform unitary (energy-preserving),
+            # so FFT magnitudes are on the same scale as pixel-space losses.
+            fft_diff = (
+                torch.fft.rfft2(pred_s, norm="ortho")
+                - torch.fft.rfft2(tgt_s, norm="ortho")
+            )
+            # Mean L1 over all frequency bins and channels → [B, N]
+            fft_loss = fft_diff.abs().mean(dim=(-3, -2, -1)).reshape(B, N)
+            loss = loss + self.fft_loss_weight * fft_loss
+
         effective_mask = mask
         if pad_mask is not None:
             patch_pad = _pixel_pad_mask_to_patch(pad_mask, self.patch_size)
@@ -845,6 +863,7 @@ def create_mae_vit(
     decoder_pred_hidden_dim: Optional[int] = None,
     l1_loss_weight: float = 0.0,
     l2_loss_weight: float = 1.0,
+    fft_loss_weight: float = 0.0,
     max_image_height: Optional[int] = None,
 ) -> MaskedAutoencoderViT:
     """
@@ -874,6 +893,7 @@ def create_mae_vit(
         decoder_pred_hidden_dim=decoder_pred_hidden_dim,
         l1_loss_weight=l1_loss_weight,
         l2_loss_weight=l2_loss_weight,
+        fft_loss_weight=fft_loss_weight,
         max_image_height=max_image_height,
     )
 

@@ -512,6 +512,7 @@ def save_checkpoint(
         'decoder_pred_hidden_dim': model.decoder_pred_hidden_dim,
         'l1_loss_weight': model.l1_loss_weight,
         'l2_loss_weight': model.l2_loss_weight,
+        'fft_loss_weight': model.fft_loss_weight,
     }
 
     torch.save({
@@ -547,6 +548,7 @@ def load_checkpoint(
     config.pop('pixel_max', None)
     config.setdefault('l1_loss_weight', 0.0)
     config.setdefault('l2_loss_weight', 1.0)
+    config.setdefault('fft_loss_weight', 0.0)
     # Legacy: older checkpoints stored a fixed letterbox canvas
     # (image_height, image_width or image_size). Re-interpret the height as
     # the new ``max_image_height`` cap and drop the width (no longer used).
@@ -599,6 +601,7 @@ def mae_model_summary(model: MaskedAutoencoderViT) -> Dict[str, Any]:
         'decoder_pred_hidden_dim': model.decoder_pred_hidden_dim,
         'l1_loss_weight': model.l1_loss_weight,
         'l2_loss_weight': model.l2_loss_weight,
+        'fft_loss_weight': model.fft_loss_weight,
         'num_parameters': n_params,
         'num_trainable_parameters': n_trainable,
     }
@@ -753,6 +756,105 @@ def visualize_reconstruction(
         plt.show()
 
 
+def dump_mae_training_metrics_artifacts(
+    history: Dict[str, List[float]],
+    out_dir: str,
+    epoch_1based: int,
+) -> Tuple[str, str]:
+    """
+    Persist MAE training curves up to the current epoch: a raw CSV and a PNG
+    figure (loss linear, loss log, LR). Intended to be called on the same
+    cadence as reconstruction dumps (e.g. every ``VISUALIZE_EVERY`` epochs in
+    a notebook ``on_epoch_end`` callback).
+
+    Filenames align with reconstruction naming::
+
+        mae_metrics_epoch{epoch_1based:04d}.csv
+        mae_metrics_epoch{epoch_1based:04d}.png
+
+    Args:
+        history: Dict with ``train_loss``, ``val_loss``, ``lr`` lists (same
+                 semantics as :func:`train_mae` return value).
+        out_dir:   Directory for both files (created if missing).
+        epoch_1based: Tag in filenames; typically ``epoch + 1`` when invoked
+                 from ``on_epoch_end(epoch, ...)``.
+
+    Returns:
+        ``(csv_path, png_path)`` absolute paths.
+    """
+    import csv
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = str(Path(out_dir).resolve())
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    stem = f"mae_metrics_epoch{int(epoch_1based):04d}"
+    csv_path = os.path.join(out_dir, f"{stem}.csv")
+    png_path = os.path.join(out_dir, f"{stem}.png")
+
+    train_loss = history.get("train_loss", [])
+    val_loss = history.get("val_loss", [])
+    lr_hist = history.get("lr", [])
+    n = len(train_loss)
+    if n == 0:
+        return csv_path, png_path
+
+    def _get(seq: List[float], i: int) -> float:
+        return float(seq[i]) if i < len(seq) else float("nan")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["epoch", "train_loss", "val_loss", "lr"])
+        for i in range(n):
+            w.writerow([i + 1, _get(train_loss, i), _get(val_loss, i), _get(lr_hist, i)])
+
+    epochs_so_far = list(range(1, n + 1))
+    tl = [float(train_loss[i]) for i in range(n)]
+    vl = [_get(val_loss, i) for i in range(n)]
+    lr_plot = [_get(lr_hist, i) for i in range(n)]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+
+    ax = axes[0]
+    ax.plot(epochs_so_far, tl, label="train", linewidth=1.5)
+    ax.plot(epochs_so_far, vl, label="val", linewidth=1.5)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Reconstruction loss")
+    ax.set_title("Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    ax.plot(epochs_so_far, tl, label="train", linewidth=1.5)
+    ax.plot(epochs_so_far, vl, label="val", linewidth=1.5)
+    ax.set_yscale("log")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss (log)")
+    ax.set_title("Loss (log scale)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[2]
+    ax.plot(epochs_so_far, lr_plot, color="tab:orange", linewidth=1.5)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Learning rate")
+    ax.set_title("LR schedule")
+    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"MAE training metrics (through epoch {n})", fontsize=12, y=1.02)
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"  → MAE metrics CSV: {csv_path}")
+    print(f"  → MAE metrics plot: {png_path}")
+    return csv_path, png_path
+
+
 # =====================================================================
 # Main entry point
 # =====================================================================
@@ -775,6 +877,7 @@ def train_mae(
     decoder_pred_hidden_dim: Optional[int] = None,
     l1_loss_weight: float = 0.0,
     l2_loss_weight: float = 1.0,
+    fft_loss_weight: float = 0.0,
     # --- training ---
     epochs: int = 100,
     batch_size: int = 64,
@@ -915,6 +1018,7 @@ def train_mae(
         decoder_pred_hidden_dim=decoder_pred_hidden_dim,
         l1_loss_weight=l1_loss_weight,
         l2_loss_weight=l2_loss_weight,
+        fft_loss_weight=fft_loss_weight,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -939,6 +1043,7 @@ def train_mae(
         'decoder_pred_hidden_dim': decoder_pred_hidden_dim,
         'l1_loss_weight': l1_loss_weight,
         'l2_loss_weight': l2_loss_weight,
+        'fft_loss_weight': fft_loss_weight,
         'epochs': epochs,
         'batch_size': batch_size,
         'lr': lr,
