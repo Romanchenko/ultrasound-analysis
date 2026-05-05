@@ -376,21 +376,36 @@ def _train_one_epoch(
     device: torch.device,
     mask_ratio: float,
     epoch: int,
+    scaler: Optional["torch.cuda.amp.GradScaler"] = None,
 ) -> float:
     model.train()
     total_loss = 0.0
     num_batches = 0
+    use_amp = scaler is not None
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [train]", leave=False)
     for images, pad_masks in pbar:
-        images = images.to(device)
-        pad_masks = pad_masks.to(device)
-        loss, _, _ = model(images, mask_ratio=mask_ratio, pad_mask=pad_masks)
+        # non_blocking=True lets the CPU keep going while the transfer runs
+        # (requires pin_memory=True on the DataLoader, which is already set).
+        images    = images.to(device, non_blocking=True)
+        pad_masks = pad_masks.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            loss, _, _ = model(images, mask_ratio=mask_ratio, pad_mask=pad_masks)
+
+        # set_to_none=True frees gradient buffers instead of zeroing them — faster.
+        optimizer.zero_grad(set_to_none=True)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -411,8 +426,8 @@ def _validate(
     num_batches = 0
 
     for images, pad_masks in dataloader:
-        images = images.to(device)
-        pad_masks = pad_masks.to(device)
+        images    = images.to(device, non_blocking=True)
+        pad_masks = pad_masks.to(device, non_blocking=True)
         loss, _, _ = model(images, mask_ratio=mask_ratio, pad_mask=pad_masks)
         total_loss += loss.item()
         num_batches += 1
@@ -892,8 +907,9 @@ def train_mae(
     checkpoint_dir: Optional[str] = None,
     save_every: int = 10,
     train_transform_preview: int = 4,
-    # --- device ---
+    # --- device / precision ---
     device: Optional[torch.device] = None,
+    use_amp: bool = True,
     # --- resume ---
     resume_from: Optional[str] = None,
     # --- logging ---
@@ -989,15 +1005,16 @@ def train_mae(
     def _collate(batch: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         return mae_pad_collate(batch, patch_size)
 
+    _persistent = num_workers > 0
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
-        collate_fn=_collate,
+        collate_fn=_collate, persistent_workers=_persistent,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
-        collate_fn=_collate,
+        collate_fn=_collate, persistent_workers=_persistent,
     )
 
     # ---- model ----
@@ -1062,6 +1079,12 @@ def train_mae(
         'device': str(device),
     }
 
+    # ---- AMP scaler ----
+    _use_amp = use_amp and device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler() if _use_amp else None
+    if _use_amp:
+        print("Mixed precision (AMP) enabled.")
+
     # ---- optimizer & scheduler ----
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineWarmupScheduler(
@@ -1108,7 +1131,7 @@ def train_mae(
     for epoch in range(start_epoch, epochs):
         current_lr = optimizer.param_groups[0]['lr']
         train_loss = _train_one_epoch(
-            model, train_loader, optimizer, device, mask_ratio, epoch,
+            model, train_loader, optimizer, device, mask_ratio, epoch, scaler,
         )
         val_loss = _validate(model, val_loader, device, mask_ratio)
 
