@@ -704,12 +704,14 @@ class MaskedAutoencoderViT(nn.Module):
         Returns:
             Scalar loss.
         """
-        target = self.patchify(imgs)                      # [B, N, p*p*C]
+        target_raw = self.patchify(imgs)                   # [B, N, p*p*C] — raw pixels
 
         if self.norm_pix_loss:
-            mean = target.mean(dim=-1, keepdim=True)
-            var = target.var(dim=-1, keepdim=True)
-            target = (target - mean) / (var + 1e-6).sqrt()
+            mean = target_raw.mean(dim=-1, keepdim=True)
+            var  = target_raw.var(dim=-1, keepdim=True)
+            target = (target_raw - mean) / (var + 1e-6).sqrt()
+        else:
+            target = target_raw
 
         diff = pred - target
         l1 = diff.abs().mean(dim=-1)                      # [B, N]
@@ -719,11 +721,16 @@ class MaskedAutoencoderViT(nn.Module):
         if self.fft_loss_weight > 0:
             p = self.patch_size
             B, N, _ = pred.shape
-            # Reshape to spatial [B*N, C, p, p] for 2D FFT
-            pred_s = pred.reshape(B * N, self.in_channels, p, p)
-            tgt_s  = target.reshape(B * N, self.in_channels, p, p)
-            # norm="ortho" makes the transform unitary (energy-preserving),
-            # so FFT magnitudes are on the same scale as pixel-space losses.
+            # FFT is computed on raw (un-normalized) patches so the DC component
+            # (inter-patch brightness) is preserved. If norm_pix_loss is on, we
+            # must un-normalize pred back to raw pixel space first.
+            if self.norm_pix_loss:
+                pred_raw = pred * (var + 1e-6).sqrt() + mean
+            else:
+                pred_raw = pred
+            pred_s = pred_raw.reshape(B * N, self.in_channels, p, p)
+            tgt_s  = target_raw.reshape(B * N, self.in_channels, p, p)
+            # norm="ortho" makes the transform unitary (energy-preserving).
             fft_diff = (
                 torch.fft.rfft2(pred_s, norm="ortho")
                 - torch.fft.rfft2(tgt_s, norm="ortho")
