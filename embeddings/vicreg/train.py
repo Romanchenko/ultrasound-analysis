@@ -43,7 +43,7 @@ from embeddings.vit.train import (
     standardize_per_image,
     MAEValTransform,
 )
-from embeddings.vicreg.model import VICRegModel, create_vicreg
+from embeddings.vicreg.model import VICRegModel, create_vicreg, create_vicreg_timm
 from embeddings.rank_me import collect_embeddings, compute_rank_me
 
 
@@ -156,6 +156,30 @@ def vicreg_pad_collate(
 # Checkpointing
 # =====================================================================
 
+def _encoder_config(model: VICRegModel) -> dict:
+    """Serializable config needed to reconstruct the encoder from scratch."""
+    from embeddings.timm_encoder import TimmViTEncoder
+    enc = model.encoder
+    if isinstance(enc, TimmViTEncoder):
+        return {
+            'encoder_type': 'timm',
+            'timm_model': enc.model_name,
+            'projector_dim': model.projector_dim,
+            'projector_layers': model.projector_layers,
+        }
+    return {
+        'encoder_type': 'mae',
+        'patch_size': enc.patch_size,
+        'embed_dim': enc.embed_dim,
+        'depth': enc.depth,
+        'num_heads': enc.num_heads,
+        'mlp_ratio': enc.mlp_ratio,
+        'max_image_height': enc.max_image_height,
+        'projector_dim': model.projector_dim,
+        'projector_layers': model.projector_layers,
+    }
+
+
 def save_checkpoint(
     model: VICRegModel,
     optimizer: optim.Optimizer,
@@ -166,7 +190,6 @@ def save_checkpoint(
     path: str,
 ) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    enc = model.encoder
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -174,16 +197,7 @@ def save_checkpoint(
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
         'train_loss': train_loss,
         'val_loss': val_loss,
-        'model_config': {
-            'patch_size': enc.patch_size,
-            'embed_dim': enc.embed_dim,
-            'depth': enc.depth,
-            'num_heads': enc.num_heads,
-            'mlp_ratio': enc.mlp_ratio,
-            'max_image_height': enc.max_image_height,
-            'projector_dim': model.projector_dim,
-            'projector_layers': model.projector_layers,
-        },
+        'model_config': _encoder_config(model),
     }, path)
 
 
@@ -202,16 +216,24 @@ def load_checkpoint(
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ckpt = torch.load(path, map_location='cpu')
     cfg = ckpt['model_config']
-    model = create_vicreg(
-        patch_size=cfg['patch_size'],
-        embed_dim=cfg['embed_dim'],
-        depth=cfg['depth'],
-        num_heads=cfg['num_heads'],
-        mlp_ratio=cfg['mlp_ratio'],
-        projector_dim=cfg['projector_dim'],
-        projector_layers=cfg['projector_layers'],
-        max_image_height=cfg.get('max_image_height'),
-    )
+    if cfg.get('encoder_type') == 'timm':
+        model = create_vicreg_timm(
+            timm_model=cfg['timm_model'],
+            projector_dim=cfg['projector_dim'],
+            projector_layers=cfg['projector_layers'],
+            pretrained=False,  # weights come from the checkpoint
+        )
+    else:
+        model = create_vicreg(
+            patch_size=cfg['patch_size'],
+            embed_dim=cfg['embed_dim'],
+            depth=cfg['depth'],
+            num_heads=cfg['num_heads'],
+            mlp_ratio=cfg['mlp_ratio'],
+            projector_dim=cfg['projector_dim'],
+            projector_layers=cfg['projector_layers'],
+            max_image_height=cfg.get('max_image_height'),
+        )
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
     model.to(device)
@@ -224,15 +246,13 @@ def load_checkpoint(
 # =====================================================================
 
 def _vicreg_model_summary(model: VICRegModel) -> Dict[str, Any]:
+    from embeddings.timm_encoder import TimmViTEncoder
     enc = model.encoder
     n_enc = sum(p.numel() for p in model.encoder_parameters())
     n_proj = sum(p.numel() for p in model.projector.parameters())
-    return {
+    base = {
         'patch_size': enc.patch_size,
         'embed_dim': enc.embed_dim,
-        'depth': enc.depth,
-        'num_heads': enc.num_heads,
-        'mlp_ratio': enc.mlp_ratio,
         'max_image_height': enc.max_image_height,
         'projector_dim': model.projector_dim,
         'projector_layers': model.projector_layers,
@@ -240,6 +260,15 @@ def _vicreg_model_summary(model: VICRegModel) -> Dict[str, Any]:
         'num_projector_parameters': n_proj,
         'num_trainable_parameters': n_enc + n_proj,
     }
+    if isinstance(enc, TimmViTEncoder):
+        base['encoder_type'] = 'timm'
+        base['timm_model'] = enc.model_name
+    else:
+        base['encoder_type'] = 'mae'
+        base['depth'] = enc.depth
+        base['num_heads'] = enc.num_heads
+        base['mlp_ratio'] = enc.mlp_ratio
+    return base
 
 
 def dump_vicreg_training_results(
@@ -443,8 +472,11 @@ def train_vicreg(
     save_every: int = 10,
     rankme_every: int = 0,
     plot_every: int = 0,
-    # --- warm-start ---
+    # --- encoder selection ---
+    timm_encoder: Optional[str] = None,
+    # --- warm-start (mae encoder only) ---
     mae_init_checkpoint: Optional[str] = None,
+    pretrained_encoder: Optional[str] = None,
     # --- device / precision ---
     device: Optional[torch.device] = None,
     use_amp: bool = True,
@@ -543,26 +575,45 @@ def train_vicreg(
     )
 
     # ---- model ----
-    model = create_vicreg(
-        patch_size=patch_size,
-        embed_dim=embed_dim,
-        depth=depth,
-        num_heads=num_heads,
-        mlp_ratio=mlp_ratio,
-        projector_dim=projector_dim,
-        projector_layers=projector_layers,
-        max_image_height=max_image_height,
-    ).to(device)
+    if timm_encoder is not None:
+        model = create_vicreg_timm(
+            timm_model=timm_encoder,
+            projector_dim=projector_dim,
+            projector_layers=projector_layers,
+        ).to(device)
+        print(f"Using timm encoder: {timm_encoder}")
+    else:
+        model = create_vicreg(
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            projector_dim=projector_dim,
+            projector_layers=projector_layers,
+            max_image_height=max_image_height,
+        ).to(device)
 
     if mae_init_checkpoint is not None:
-        ckpt = torch.load(mae_init_checkpoint, map_location='cpu')
-        missing, unexpected = model.encoder.load_state_dict(
-            ckpt['model_state_dict'], strict=False
-        )
-        print(
-            f"MAE encoder warm-start: {len(missing)} missing, "
-            f"{len(unexpected)} unexpected keys (decoder keys expected)."
-        )
+        if timm_encoder is not None:
+            print("Warning: mae_init_checkpoint is ignored when timm_encoder is set.")
+        else:
+            ckpt = torch.load(mae_init_checkpoint, map_location='cpu')
+            missing, unexpected = model.encoder.load_state_dict(
+                ckpt['model_state_dict'], strict=False
+            )
+            print(
+                f"MAE encoder warm-start: {len(missing)} missing, "
+                f"{len(unexpected)} unexpected keys (decoder keys expected)."
+            )
+
+    if pretrained_encoder is not None and mae_init_checkpoint is None and resume_from is None:
+        if timm_encoder is not None:
+            print("Warning: pretrained_encoder is ignored when timm_encoder is set.")
+        else:
+            from embeddings.pretrained_loader import load_pretrained_vit_encoder
+            _pt_info = load_pretrained_vit_encoder(model.encoder, pretrained_encoder)
+            print(f"Pretrained init: {_pt_info['summary']}")
 
     n_enc  = sum(p.numel() for p in model.encoder_parameters())
     n_proj = sum(p.numel() for p in model.projector.parameters())
@@ -593,7 +644,9 @@ def train_vicreg(
         'save_every': save_every,
         'rankme_every': rankme_every,
         'plot_every': plot_every,
+        'timm_encoder': timm_encoder,
         'mae_init_checkpoint': mae_init_checkpoint,
+        'pretrained_encoder': pretrained_encoder,
         'resume_from': resume_from,
         'n_train_samples': n_train,
         'n_val_samples': n_val,

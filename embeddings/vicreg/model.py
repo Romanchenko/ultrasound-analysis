@@ -5,7 +5,7 @@ Bardes et al., "VICReg: Variance-Invariance-Covariance Regularization for
 Self-Supervised Learning", ICLR 2022.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -40,7 +40,7 @@ class VICRegModel(nn.Module):
 
     def __init__(
         self,
-        encoder: MaskedAutoencoderViT,
+        encoder: nn.Module,
         projector_dim: int = 2048,
         projector_layers: int = 3,
     ):
@@ -114,7 +114,7 @@ class VICRegModel(nn.Module):
     # ------------------------------------------------------------------
 
     def encoder_parameters(self):
-        """Yields only encoder (ViT) parameters — excludes decoder and projector."""
+        """Yields only encoder parameters — excludes MAE decoder/mask_token and projector."""
         for n, p in self.encoder.named_parameters():
             if not n.startswith(('decoder', 'mask_token')):
                 yield p
@@ -160,4 +160,27 @@ def create_vicreg(
         clip_pixel_pred=False,
         max_image_height=max_image_height,
     )
+    return VICRegModel(encoder, projector_dim=projector_dim, projector_layers=projector_layers)
+
+
+def create_vicreg_timm(
+    timm_model: str,
+    projector_dim: int = 2048,
+    projector_layers: int = 3,
+    pretrained: bool = True,
+    channel_avg: bool = True,
+) -> VICRegModel:
+    """
+    Create a VICReg model with a pretrained timm ViT as the encoder.
+
+    The timm ViT is wrapped by ``TimmViTEncoder`` which adapts it to 1-channel
+    grayscale input and exposes the same ``encode()`` interface.  Variable-size
+    inputs are supported via positional-embedding interpolation (dynamic_img_size).
+
+    Example::
+
+        model = create_vicreg_timm("vit_small_patch16_224.dino")
+    """
+    from embeddings.timm_encoder import TimmViTEncoder
+    encoder = TimmViTEncoder(timm_model, pretrained=pretrained, channel_avg=channel_avg)
     return VICRegModel(encoder, projector_dim=projector_dim, projector_layers=projector_layers)
