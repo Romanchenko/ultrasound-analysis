@@ -748,6 +748,32 @@ class MaskedAutoencoderViT(nn.Module):
         loss = (loss * effective_mask).sum() / denom
         return loss
 
+    def reference_mse(
+        self,
+        imgs: torch.Tensor,
+        pred: torch.Tensor,
+        mask: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Pure normalized per-patch MSE on masked content patches.
+
+        Independent of l1/l2/fft loss weights — use this to compare runs
+        trained with different loss configurations on equal footing.
+        Matches the metric reported in He et al. (MAE, 2022).
+        """
+        target = self.patchify(imgs)
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var  = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1e-6).sqrt()
+        mse_per_patch = (pred - target).pow(2).mean(dim=-1)   # [B, N]
+        eff_mask = mask
+        if pad_mask is not None:
+            pp = _pixel_pad_mask_to_patch(pad_mask, self.patch_size)
+            eff_mask = mask * (~pp).float()
+        return (mse_per_patch * eff_mask).sum() / eff_mask.sum().clamp_min(1.0)
+
     # -----------------------------------------------------------------
     # Full forward (training)
     # -----------------------------------------------------------------

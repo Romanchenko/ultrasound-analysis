@@ -23,6 +23,7 @@ from embeddings.vit.model import (
     create_mae_vit,
 )
 from embeddings.vit.train import (
+    dump_mae_training_metrics_artifacts,
     load_checkpoint,
     train_mae,
     visualize_reconstruction,
@@ -34,5 +35,6 @@ __all__ = [
     "train_mae",
     "load_checkpoint",
     "visualize_reconstruction",
+    "dump_mae_training_metrics_artifacts",
 ]
 

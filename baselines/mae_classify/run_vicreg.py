@@ -1,21 +1,21 @@
 """
-Classification baseline using a frozen MAE encoder with a trainable MLP head.
+Classification baseline using a frozen VICReg encoder with a trainable MLP head.
 
-Loads a pretrained MAE-ViT checkpoint, freezes the encoder, trains a
+Loads a pretrained VICReg checkpoint, freezes the encoder, trains a
 classification head on labels from ``processed_iter_1.csv``, and reports
 balanced accuracy, F1, and a confusion matrix.
 
-All paths and hyperparameters are configurable via environment variables
-(see the table in the accompanying readme / plan).
+``VICRegModel.encode()`` is used for embedding extraction (no projector —
+raw encoder representations, same as what RankME measures during SSL training).
 
-Each training epoch writes ``METRICS_CSV`` (default ``training_metrics.csv``) with
-loss, accuracy, and balanced accuracy for **train** and **validation**.
+All paths and hyperparameters are configurable via environment variables
+(identical set to ``run.py``).
 
 Usage::
 
     DIR_IMAGES=/data/npy \
-    PATH_MAE_CHECKPOINT=checkpoints/mae_final.pt \
-    python baselines/mae_classify/run.py
+    PATH_MAE_CHECKPOINT=checkpoints/vicreg_final.pt \
+    python baselines/mae_classify/run_vicreg.py
 """
 
 import json
@@ -56,30 +56,19 @@ VAL_SPLIT = float(os.environ.get("VAL_SPLIT", "0.2"))
 HEAD_HIDDEN_DIM = int(os.environ.get("HEAD_HIDDEN_DIM", "0"))
 HEAD_DROPOUT = float(os.environ.get("HEAD_DROPOUT", "0.1"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
-# Cap on per-image height (aspect preserved, never upscaled, never letterboxed
-# to a fixed width). Legacy ``IMAGE_HEIGHT`` / ``IMAGE_SIZE`` fall back to the
-# same value.
 MAX_IMAGE_HEIGHT = int(
     os.environ.get(
         "MAX_IMAGE_HEIGHT",
         os.environ.get("IMAGE_HEIGHT", os.environ.get("IMAGE_SIZE", "224")),
     )
 )
-# Per-image z-score standardisation ``(img - mean) / std``. Must match the
-# transform used to pre-train the MAE encoder (see
-# ``embeddings.vit.train.standardize_per_image``). Setting this to ``0`` is
-# only correct when evaluating a legacy checkpoint pre-trained without
-# standardisation.
 STANDARDIZE_INPUT = os.environ.get("STANDARDIZE_INPUT", "1").strip().lower() in (
     "1", "true", "yes",
 )
 SEED = int(os.environ.get("SEED", "42"))
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "run_config.json")
 PATH_HEAD_CHECKPOINT = os.environ.get("PATH_HEAD_CHECKPOINT", "best_head.pt")
-# If set, load this timm model directly instead of PATH_MAE_CHECKPOINT.
-# Example: TIMM_MODEL=vit_small_patch16_224.dino
 TIMM_MODEL = os.environ.get("TIMM_MODEL", "").strip()
-# Per-epoch metrics table for plotting (loss, accuracy, balanced accuracy).
 METRICS_CSV = os.environ.get("METRICS_CSV", "training_metrics.csv")
 _mode_raw = os.environ.get("MODE", "train").strip().lower()
 _eval_flag = os.environ.get("EVAL_ONLY", "").strip().lower() in ("1", "true", "yes")
@@ -104,11 +93,6 @@ def _parse_exclude_ids(raw: str) -> Set[int]:
 # ---------------------------------------------------------------------------
 
 def _standardize_per_image(img: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Per-image z-score normalisation ``(img - mean) / std`` over all pixels.
-
-    Mirror of :func:`embeddings.vit.train.standardize_per_image` so the
-    classifier sees the same pixel distribution the MAE encoder was trained on.
-    """
     mean = img.mean()
     std = img.std().clamp_min(eps)
     return (img - mean) / std
@@ -117,16 +101,6 @@ def _standardize_per_image(img: torch.Tensor, eps: float = 1e-6) -> torch.Tensor
 def load_npy_as_grayscale_tensor(
     path: str, max_image_height: int, standardize: bool = True,
 ) -> torch.Tensor:
-    """Load a ``.npy`` RGB image, convert to grayscale ``[1, H, W]`` float tensor.
-
-    * Raw pixels are scaled to ``[0, 1]``.
-    * If ``H > max_image_height``, shrink so ``H = max_image_height`` (aspect
-      ratio kept; never upscaled, never letterboxed).
-    * If ``standardize`` is True (default), apply per-image z-score so the
-      tensor matches the distribution the MAE encoder was pre-trained on
-      (see ``embeddings.vit.train.standardize_per_image``). This flag must
-      be set identically at MAE pre-training and at classification time.
-    """
     import torchvision.transforms.functional as F
 
     npy = np.load(path)
@@ -154,12 +128,6 @@ def load_npy_as_grayscale_tensor(
 def pad_classify_collate(
     batch: List[Tuple[torch.Tensor, int, str]], patch_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
-    """
-    Collate variable-shape ``[1, H_i, W_i]`` images into a zero-padded batch.
-
-    Output shapes: ``(max_h, max_w)`` rounded up to a ``patch_size`` multiple,
-    plus a boolean ``pad_mask`` (True on padded pixels).
-    """
     imgs = [it[0] for it in batch]
     labels = torch.tensor([int(it[1]) for it in batch], dtype=torch.long)
     paths = [str(it[2]) for it in batch]
@@ -183,12 +151,6 @@ def pad_classify_collate(
 # ---------------------------------------------------------------------------
 
 class ClassificationDataset(Dataset):
-    """Dataset backed by ``processed_iter_1.csv``.
-
-    Loads ``.npy`` images, converts to grayscale, resizes, and returns
-    ``(image, seq_label)`` where ``seq_label`` is a contiguous 0-based index.
-    """
-
     def __init__(
         self,
         dir_images: str,
@@ -242,8 +204,6 @@ class ClassificationDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 class MLPHead(nn.Module):
-    """MLP classification head: Linear -> GELU -> Dropout -> Linear."""
-
     def __init__(self, embed_dim: int, num_classes: int, hidden_dim: int = 0, dropout: float = 0.1):
         super().__init__()
         hid = hidden_dim if hidden_dim > 0 else embed_dim
@@ -258,23 +218,27 @@ class MLPHead(nn.Module):
         return self.net(x)
 
 
-class MAEClassifier(nn.Module):
-    """Frozen MAE encoder + trainable classification head."""
+class VICRegClassifier(nn.Module):
+    """Frozen VICReg encoder + trainable classification head.
 
-    def __init__(self, encoder: nn.Module, head: nn.Module):
+    Uses ``VICRegModel.encode()`` which returns raw encoder embeddings
+    (before the projector), the same representations evaluated by RankME.
+    """
+
+    def __init__(self, vicreg_model: nn.Module, head: nn.Module):
         super().__init__()
-        self.encoder = encoder
+        self.vicreg = vicreg_model
         self.head = head
 
-        self.encoder.eval()
-        for p in self.encoder.parameters():
+        self.vicreg.eval()
+        for p in self.vicreg.parameters():
             p.requires_grad = False
 
     def forward(
         self, imgs: torch.Tensor, pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         with torch.no_grad():
-            emb = self.encoder.encode(imgs, pad_mask=pad_mask)
+            emb = self.vicreg.encode(imgs, pad_mask=pad_mask)
         return self.head(emb)
 
 
@@ -283,14 +247,13 @@ class MAEClassifier(nn.Module):
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(
-    model: MAEClassifier,
+    model: VICRegClassifier,
     loader: DataLoader,
     optimizer: optim.Optimizer,
     criterion: nn.Module,
     device_: torch.device,
     epoch: int,
 ) -> Tuple[float, float, float]:
-    """Returns ``(mean_loss, accuracy, balanced_accuracy)`` on the training set."""
     model.train()
     total_loss = 0.0
     correct = 0
@@ -320,20 +283,17 @@ def train_one_epoch(
 
     y_true = np.concatenate(all_true) if all_true else np.array([])
     y_pred = np.concatenate(all_pred) if all_pred else np.array([])
-    train_bal = (
-        float(balanced_accuracy_score(y_true, y_pred)) if len(y_true) > 0 else 0.0
-    )
+    train_bal = float(balanced_accuracy_score(y_true, y_pred)) if len(y_true) > 0 else 0.0
     return total_loss / max(total, 1), correct / max(total, 1), train_bal
 
 
 @torch.no_grad()
 def evaluate(
-    model: MAEClassifier,
+    model: VICRegClassifier,
     loader: DataLoader,
     criterion: nn.Module,
     device_: torch.device,
 ) -> Tuple[float, float, np.ndarray, np.ndarray]:
-    """Returns ``(loss, accuracy, y_true, y_pred)``."""
     model.eval()
     total_loss = 0.0
     correct = 0
@@ -370,7 +330,6 @@ def stratified_split(
     val_fraction: float,
     seed: int,
 ) -> Tuple[Subset, Subset]:
-    """Split *dataset* into train/val subsets with stratification by class."""
     rng = np.random.RandomState(seed)
     labels = np.array([d["seq_idx"] for d in dataset.data])
     train_indices: List[int] = []
@@ -390,22 +349,14 @@ def stratified_split(
 # Metrics & output
 # ---------------------------------------------------------------------------
 
-
-def write_training_metrics_csv(
-    history: Dict[str, List[float]],
-    path: str,
-) -> None:
-    """Write one row per epoch: loss, accuracy, balanced accuracy for train and val.
-
-    Intended for plotting (pandas, matplotlib, seaborn, etc.).
-    """
+def write_training_metrics_csv(history: Dict[str, List[float]], path: str) -> None:
     n = len(history["train_loss"])
     if n == 0:
         return
 
     rows: List[Dict[str, object]] = []
     for i in range(n):
-        row: Dict[str, object] = {
+        rows.append({
             "epoch": i + 1,
             "train_loss": float(history["train_loss"][i]),
             "train_accuracy": float(history["train_acc"][i]),
@@ -413,8 +364,7 @@ def write_training_metrics_csv(
             "val_loss": float(history["val_loss"][i]),
             "val_accuracy": float(history["val_acc"][i]),
             "val_balanced_accuracy": float(history["val_bal_acc"][i]),
-        }
-        rows.append(row)
+        })
 
     out = os.path.abspath(path)
     parent = os.path.dirname(out)
@@ -429,7 +379,6 @@ def compute_and_print_metrics(
     class_names: Dict[int, str],
     num_classes: int,
 ) -> Dict:
-    """Compute and print balanced accuracy, F1, and confusion matrix."""
     labels = list(range(num_classes))
     target_names = [class_names.get(i, str(i)) for i in labels]
 
@@ -442,10 +391,7 @@ def compute_and_print_metrics(
     print(f"Macro F1:          {f1_macro:.4f}\n")
     print("Classification report:")
     print(classification_report(
-        y_true, y_pred,
-        labels=labels,
-        target_names=target_names,
-        zero_division=0,
+        y_true, y_pred, labels=labels, target_names=target_names, zero_division=0,
     ))
     print("Confusion matrix:")
     print(cm)
@@ -462,16 +408,16 @@ def compute_and_print_metrics(
 def build_train_config(
     encoder_checkpoint: str,
     encoder_info: Dict,
-    dataset: "ClassificationDataset",
+    dataset: ClassificationDataset,
     n_train: int,
     n_val: int,
 ) -> Dict:
-    """Collect every setting needed to reproduce the training run."""
-    head_hid = HEAD_HIDDEN_DIM if HEAD_HIDDEN_DIM > 0 else encoder_info.get("model_config", {}).get("embed_dim", "?")
+    model_cfg = encoder_info.get("model_config", {})
+    head_hid = HEAD_HIDDEN_DIM if HEAD_HIDDEN_DIM > 0 else model_cfg.get("embed_dim", "?")
     return {
-        "mae_checkpoint": os.path.abspath(encoder_checkpoint),
-        "mae_epoch": encoder_info.get("epoch"),
-        "mae_model_config": encoder_info.get("model_config"),
+        "vicreg_checkpoint": os.path.abspath(encoder_checkpoint),
+        "vicreg_epoch": encoder_info.get("epoch"),
+        "vicreg_model_config": model_cfg,
         "random_encoder": RANDOM_ENCODER,
         "dir_images": os.path.abspath(DIR_IMAGES),
         "path_csv": os.path.abspath(PATH_CSV),
@@ -506,15 +452,9 @@ def save_run_config(
     final_metrics: Optional[Dict] = None,
     path: str = "run_config.json",
 ):
-    """Write a JSON file capturing the full run for reproducibility."""
-    payload = {
-        "train_config": train_config,
-        "history": history,
-    }
+    payload = {"train_config": train_config, "history": history}
     if final_metrics is not None:
-        serialisable_metrics = {
-            k: v for k, v in final_metrics.items() if k != "confusion_matrix"
-        }
+        serialisable_metrics = {k: v for k, v in final_metrics.items() if k != "confusion_matrix"}
         serialisable_metrics["confusion_matrix"] = final_metrics["confusion_matrix"].tolist()
         payload["final_metrics"] = serialisable_metrics
 
@@ -530,11 +470,10 @@ def save_results(
     paths: List[str],
     class_names: Dict[int, str],
 ):
-    """Write ``test_results.csv``, ``confusion_matrix.csv``, and ``test_prediction.json``."""
     target_names = metrics["class_names"]
 
     row = {
-        "model": "MAE-ViT",
+        "model": "VICReg-ViT",
         "balanced_accuracy": metrics["balanced_accuracy"],
         "f1_macro": metrics["f1_macro"],
     }
@@ -544,11 +483,7 @@ def save_results(
     pd.DataFrame([row]).to_csv("test_results.csv", index=False)
     print("Saved test_results.csv")
 
-    cm_df = pd.DataFrame(
-        metrics["confusion_matrix"],
-        index=target_names,
-        columns=target_names,
-    )
+    cm_df = pd.DataFrame(metrics["confusion_matrix"], index=target_names, columns=target_names)
     cm_df.to_csv("confusion_matrix.csv")
     print("Saved confusion_matrix.csv")
 
@@ -557,9 +492,7 @@ def save_results(
     with open("test_prediction.json", "w", encoding="utf-8") as f:
         json.dump(
             {"prediction": pred_names, "label": true_names, "paths": paths},
-            f,
-            indent=2,
-            ensure_ascii=False,
+            f, indent=2, ensure_ascii=False,
         )
     print("Saved test_prediction.json")
 
@@ -568,16 +501,7 @@ def save_results(
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def _save_head_checkpoint(
-    model,
-    optimizer,
-    epoch,
-    val_bal_acc,
-    train_config,
-    history,
-    path,
-):
-    """Save head weights, optimizer state, and config for resume/eval."""
+def _save_head_checkpoint(model, optimizer, epoch, val_bal_acc, train_config, history, path):
     torch.save({
         "head_state_dict": model.head.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -589,7 +513,6 @@ def _save_head_checkpoint(
 
 
 def _load_head_checkpoint(path, model, optimizer=None):
-    """Load head checkpoint; optionally restore optimizer state."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.head.load_state_dict(ckpt["head_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
@@ -602,7 +525,6 @@ def _load_head_checkpoint(path, model, optimizer=None):
 # ---------------------------------------------------------------------------
 
 def _final_evaluate(model, val_loader, val_ds, ds, criterion):
-    """Run evaluation on the val set, print metrics, and save result files."""
     val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, device)
     val_paths = [ds.data[idx]["img"] for idx in val_ds.indices]
     metrics = compute_and_print_metrics(y_true, y_pred, ds.class_names, ds.num_classes)
@@ -615,11 +537,11 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(script_dir, "..", ".."))
     sys.path.insert(0, script_dir)
-    from embeddings.vit.train import load_checkpoint
+    from embeddings.vicreg.train import load_checkpoint
 
     if not PATH_MAE_CHECKPOINT and not TIMM_MODEL:
         raise RuntimeError(
-            "Set PATH_MAE_CHECKPOINT (MAE checkpoint) or TIMM_MODEL (timm model name)"
+            "Set PATH_MAE_CHECKPOINT (VICReg checkpoint) or TIMM_MODEL (timm model name)"
         )
     if MODE not in ("train", "resume", "eval"):
         raise RuntimeError(f"MODE must be train, resume, or eval -- got: {MODE}")
@@ -639,16 +561,21 @@ def main():
         if RANDOM_ENCODER:
             encoder._init_weights()
             print("*** RANDOM ENCODER baseline — timm architecture, weights re-initialised ***")
+        vicreg_model = encoder
         ckpt_info = {"epoch": "pretrained", "model_config": {"timm_model": TIMM_MODEL}}
     else:
         print(f"Checkpoint: {PATH_MAE_CHECKPOINT}")
-        encoder, ckpt_info = load_checkpoint(PATH_MAE_CHECKPOINT, device=device)
+        vicreg_model, ckpt_info = load_checkpoint(PATH_MAE_CHECKPOINT, device=device)
         if RANDOM_ENCODER:
-            encoder._init_weights()
+            vicreg_model.encoder._init_weights()
             print("*** RANDOM ENCODER baseline — architecture from checkpoint, weights re-initialised ***")
 
-    embed_dim = encoder.embed_dim
-    print(f"Encoder embed_dim={embed_dim}, loaded from {TIMM_MODEL or ckpt_info.get('epoch', '?')}")
+    embed_dim = vicreg_model.embed_dim if TIMM_MODEL else vicreg_model.encoder.embed_dim
+    patch_size = vicreg_model.patch_size if TIMM_MODEL else vicreg_model.encoder.patch_size
+    print(
+        f"Encoder embed_dim={embed_dim}, patch_size={patch_size}, "
+        f"loaded from {TIMM_MODEL or ckpt_info.get('epoch', '?')}"
+    )
 
     ds = ClassificationDataset(
         dir_images=DIR_IMAGES,
@@ -660,7 +587,7 @@ def main():
     )
     print(
         f"Input standardisation: {'ON' if STANDARDIZE_INPUT else 'OFF'} "
-        f"(must match the MAE pre-training transform)"
+        f"(must match the VICReg pre-training transform)"
     )
     num_classes = ds.num_classes
     print(f"Dataset: {len(ds)} samples, {num_classes} classes")
@@ -670,8 +597,6 @@ def main():
 
     train_ds, val_ds = stratified_split(ds, VAL_SPLIT, SEED)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
-
-    patch_size = int(encoder.patch_size)
 
     def _collate(batch):
         return pad_classify_collate(batch, patch_size)
@@ -690,7 +615,7 @@ def main():
     criterion = nn.CrossEntropyLoss()
 
     # ===================================================================
-    # MODE: eval -- load existing head checkpoint and evaluate only
+    # MODE: eval
     # ===================================================================
     if MODE == "eval":
         print(f"\n*** Evaluation-only mode -- loading head from {PATH_HEAD_CHECKPOINT} ***")
@@ -699,7 +624,7 @@ def main():
         head = MLPHead(embed_dim, num_classes,
                        saved_cfg.get("head_hidden_dim", HEAD_HIDDEN_DIM),
                        saved_cfg.get("head_dropout", HEAD_DROPOUT))
-        model = MAEClassifier(encoder, head).to(device)
+        model = VICRegClassifier(vicreg_model, head).to(device)
         model.head.load_state_dict(head_ckpt["head_state_dict"])
         print(f"Head loaded (trained epoch {head_ckpt.get('epoch', '?')}, "
               f"val_bal_acc={100 * head_ckpt.get('val_bal_acc', 0):.2f}%)")
@@ -733,7 +658,7 @@ def main():
         head = MLPHead(embed_dim, num_classes,
                        saved_cfg.get("head_hidden_dim", HEAD_HIDDEN_DIM),
                        saved_cfg.get("head_dropout", HEAD_DROPOUT))
-        model = MAEClassifier(encoder, head).to(device)
+        model = VICRegClassifier(vicreg_model, head).to(device)
         model.head.load_state_dict(head_ckpt["head_state_dict"])
         optimizer = optim.AdamW(model.head.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
         if "optimizer_state_dict" in head_ckpt:
@@ -755,7 +680,7 @@ def main():
               f"will train to epoch {EPOCHS}")
     else:
         head = MLPHead(embed_dim, num_classes, HEAD_HIDDEN_DIM, HEAD_DROPOUT)
-        model = MAEClassifier(encoder, head).to(device)
+        model = VICRegClassifier(vicreg_model, head).to(device)
         optimizer = optim.AdamW(model.head.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -765,15 +690,13 @@ def main():
     train_config = build_train_config(
         TIMM_MODEL or PATH_MAE_CHECKPOINT, ckpt_info, ds, len(train_ds), len(val_ds),
     )
-    print(f"Per-epoch metrics (loss / accuracy / balanced accuracy): {os.path.abspath(METRICS_CSV)}")
+    print(f"Per-epoch metrics: {os.path.abspath(METRICS_CSV)}")
 
     for epoch in range(start_epoch, EPOCHS + 1):
         train_loss, train_acc, train_bal_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device, epoch,
         )
-        val_loss, val_acc, y_true, y_pred = evaluate(
-            model, val_loader, criterion, device,
-        )
+        val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, device)
         val_bal_acc = balanced_accuracy_score(y_true, y_pred) if len(y_true) > 0 else 0.0
         val_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0) if len(y_true) > 0 else 0.0
 
