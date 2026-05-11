@@ -74,10 +74,17 @@ class ClinicalStudiesDataset(Dataset):
                 data = f.read()
 
         ds = pydicom.dcmread(io.BytesIO(data), force=True)
-        arr = ds.pixel_array  # [H, W] or [N, H, W] for multi-frame cine
+        arr = ds.pixel_array  # [H, W], [N, H, W], or [N, H, W, C]
 
-        # Multi-frame: pick middle frame
-        if arr.ndim == 3:
+        # Color video (N, H, W, C) → take first frame → (H, W, C)
+        if arr.ndim == 4:
+            arr = arr[0]
+
+        # (H, W, C) color image → average channels to grayscale
+        if arr.ndim == 3 and arr.shape[-1] in (1, 3, 4):
+            arr = arr.mean(axis=-1)
+        elif arr.ndim == 3:
+            # (N, H, W) multi-frame cine → pick middle frame
             arr = arr[arr.shape[0] // 2]
 
         arr = arr.astype(np.float32)

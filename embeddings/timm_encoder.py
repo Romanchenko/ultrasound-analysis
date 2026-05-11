@@ -155,6 +155,19 @@ class TimmViTEncoder(nn.Module):
 
         return patch_tokens.mean(dim=1)
 
+    @torch.no_grad()
+    def encode_patches(
+        self,
+        imgs: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Returns [B, embed_dim, grid_h, grid_w] patch feature map for dense prediction."""
+        x = self._timm.forward_features(imgs)   # [B, n_prefix+N, D]
+        patch_tokens = x[:, self._n_prefix:]    # [B, N, D]
+        B, _, H, W = imgs.shape
+        grid_h, grid_w = H // self.patch_size, W // self.patch_size
+        return patch_tokens.transpose(1, 2).reshape(B, self.embed_dim, grid_h, grid_w)
+
     def forward(
         self, imgs: torch.Tensor, pad_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:

@@ -864,6 +864,31 @@ class MaskedAutoencoderViT(nn.Module):
             return (patches * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1.0)
         return patches.mean(dim=1)
 
+    @torch.no_grad()
+    def encode_patches(
+        self,
+        imgs: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Returns [B, embed_dim, grid_h, grid_w] patch feature map for dense prediction."""
+        x, grid_h, grid_w = self.patch_embed(imgs)
+
+        if pad_mask is not None:
+            patch_pad = _pixel_pad_mask_to_patch(pad_mask, self.patch_size)
+            x = x * (~patch_pad).unsqueeze(-1).float()
+
+        B = x.shape[0]
+        pos_h, pos_w = self._full_token_positions(B, grid_h, grid_w, x.device)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        for blk in self.blocks:
+            x = blk(x, pos_h, pos_w)
+        x = self.norm(x)
+
+        patches = x[:, 1:]  # [B, N, D]
+        return patches.transpose(1, 2).reshape(B, self.embed_dim, grid_h, grid_w)
+
     # -----------------------------------------------------------------
     # Convenience: encoder-only model for feature extraction
     # -----------------------------------------------------------------
