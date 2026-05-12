@@ -86,6 +86,7 @@ class FOCUSDataset(Dataset):
         images_dir: str = "images",
         masks_dir: str = "annfiles_mask",
         target_size: Optional[Any] = None,  # deprecated, ignored
+        preprocessed: bool = False,
     ):
         if target_size is not None:
             warnings.warn(
@@ -100,9 +101,14 @@ class FOCUSDataset(Dataset):
         self.mask_target = mask_target
         self.images_dir_name = images_dir
         self.masks_dir_name = masks_dir
+        self.preprocessed = preprocessed
 
-        self.images_dir = self.root / self.split_dir / images_dir
-        self.masks_dir = self.root / self.split_dir / masks_dir
+        split_path = self.root / self.split_dir
+        if preprocessed:
+            self.images_dir = split_path / (images_dir + '_preprocessed')
+        else:
+            self.images_dir = split_path / images_dir
+        self.masks_dir = split_path / masks_dir
 
         if not self.images_dir.exists():
             raise FileNotFoundError(f"Images directory not found: {self.images_dir}")

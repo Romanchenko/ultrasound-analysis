@@ -56,6 +56,7 @@ import torchvision.transforms as T
 from tqdm import tqdm
 
 from embeddings.vit.model import MaskedAutoencoderViT, create_mae_vit
+from embeddings.rank_me import compute_rank_me, collect_embeddings
 
 
 def apply_max_height_shrink(
@@ -420,19 +421,29 @@ def _validate(
     dataloader: DataLoader,
     device: torch.device,
     mask_ratio: float,
-) -> float:
+) -> Tuple[float, float]:
+    """Returns (val_loss, ref_mse).
+
+    val_loss  — weighted training loss (l1/l2/fft weights as configured).
+    ref_mse   — pure normalized per-patch MSE on masked patches, independent
+                of loss weights; use this to compare runs with different configs.
+    """
     model.eval()
-    total_loss = 0.0
-    num_batches = 0
+    total_loss    = 0.0
+    total_ref_mse = 0.0
+    num_batches   = 0
 
     for images, pad_masks in dataloader:
         images    = images.to(device, non_blocking=True)
         pad_masks = pad_masks.to(device, non_blocking=True)
-        loss, _, _ = model(images, mask_ratio=mask_ratio, pad_mask=pad_masks)
-        total_loss += loss.item()
-        num_batches += 1
+        loss, pred, mask = model(images, mask_ratio=mask_ratio, pad_mask=pad_masks)
+        ref = model.reference_mse(images, pred, mask, pad_mask=pad_masks)
+        total_loss    += loss.item()
+        total_ref_mse += ref.item()
+        num_batches   += 1
 
-    return total_loss / max(num_batches, 1)
+    n = max(num_batches, 1)
+    return total_loss / n, total_ref_mse / n
 
 
 def _save_train_transform_previews(
@@ -871,6 +882,71 @@ def dump_mae_training_metrics_artifacts(
 
 
 # =====================================================================
+# Training plots
+# =====================================================================
+
+def save_mae_training_plots(history: Dict, out_dir: str) -> str:
+    """
+    Save a PNG with loss, reference MSE, RankME (when available), and LR panels.
+    Overwrites ``{out_dir}/training_plots.png`` each call.
+
+    Returns the path written.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = len(history.get('train_loss', []))
+    if n == 0:
+        return ""
+    xs = range(1, n + 1)
+    has_rankme = any(v is not None for v in history.get('val_rank_me', []))
+    ncols = 3 + int(has_rankme)
+
+    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
+
+    ax = axes[0]
+    ax.plot(xs, history['train_loss'], label='train', linewidth=1.5)
+    ax.plot(xs, history['val_loss'],   label='val',   linewidth=1.5)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Loss')
+    ax.set_title('Reconstruction Loss')
+    ax.legend(); ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    ax.plot(xs, history['val_ref_mse'], color='tab:green', linewidth=1.5)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('MSE')
+    ax.set_title('Val Reference MSE')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[2]
+    ax.plot(xs, history['lr'], color='tab:orange', linewidth=1.5)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('LR')
+    ax.set_title('LR Schedule')
+    ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+    ax.grid(True, alpha=0.3)
+
+    if has_rankme:
+        ax = axes[3]
+        rm_xs  = [i + 1 for i, v in enumerate(history['val_rank_me'])   if v is not None]
+        rm_tr  = [v      for v in history['train_rank_me'] if v is not None]
+        rm_val = [v      for v in history['val_rank_me']   if v is not None]
+        ax.plot(rm_xs, rm_tr,  'o-', label='train', linewidth=1.5, markersize=4)
+        ax.plot(rm_xs, rm_val, 'o-', label='val',   linewidth=1.5, markersize=4)
+        ax.set_xlabel('Epoch'); ax.set_ylabel('Effective rank')
+        ax.set_title('RankME')
+        ax.legend(); ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"MAE training — epoch {n}", fontsize=11, y=1.01)
+    fig.tight_layout()
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    path = os.path.join(out_dir, 'training_plots.png')
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  → training plots saved: {path}")
+    return path
+
+
+# =====================================================================
 # Main entry point
 # =====================================================================
 
@@ -906,7 +982,11 @@ def train_mae(
     # --- checkpointing ---
     checkpoint_dir: Optional[str] = None,
     save_every: int = 10,
+    rankme_every: int = 0,
+    plot_every: int = 0,
     train_transform_preview: int = 4,
+    # --- pretrained init ---
+    pretrained_encoder: Optional[str] = None,
     # --- device / precision ---
     device: Optional[torch.device] = None,
     use_amp: bool = True,
@@ -952,6 +1032,12 @@ def train_mae(
         num_workers:      DataLoader workers.
         checkpoint_dir:   Where to save checkpoints.  ``None`` = no saving.
         save_every:       Save a checkpoint every N epochs.
+        pretrained_encoder: timm model name to warm-start the encoder from, e.g.
+                          ``"vit_small_patch16_224.dino"``. The RGB patch-embed
+                          filters are averaged to produce a single grayscale
+                          filter. The decoder stays randomly initialized.
+                          Ignored when ``resume_from`` is set (checkpoint takes
+                          precedence). ``None`` = random init (default).
         train_transform_preview: How many **random** training samples to plot (after
                           all transforms) each time a checkpoint is written; set to ``0`` to
                           disable. Only runs when *checkpoint_dir* is set. PNGs are saved
@@ -1045,6 +1131,11 @@ def train_mae(
     )
     print(f"Model parameters: {n_params:,} total | {n_enc:,} encoder")
 
+    if pretrained_encoder is not None and resume_from is None:
+        from embeddings.pretrained_loader import load_pretrained_vit_encoder
+        _pt_info = load_pretrained_vit_encoder(model, pretrained_encoder)
+        print(f"Pretrained init: {_pt_info['summary']}")
+
     training_config: Dict[str, Any] = {
         'max_image_height': max_image_height,
         'patch_size': patch_size,
@@ -1072,7 +1163,10 @@ def train_mae(
         'num_workers': num_workers,
         'checkpoint_dir': checkpoint_dir,
         'save_every': save_every,
+        'rankme_every': rankme_every,
+        'plot_every': plot_every,
         'train_transform_preview': train_transform_preview,
+        'pretrained_encoder': pretrained_encoder,
         'resume_from': resume_from,
         'n_train_samples': n_train,
         'n_val_samples': n_val,
@@ -1094,6 +1188,10 @@ def train_mae(
         min_lr=min_lr,
     )
 
+    out_json = results_json
+    if out_json is None and checkpoint_dir:
+        out_json = os.path.join(checkpoint_dir, 'mae_training_run.json')
+
     start_epoch = 0
 
     # ---- resume ----
@@ -1106,18 +1204,40 @@ def train_mae(
         start_epoch = ckpt['epoch'] + 1
         print(f"Resumed from epoch {start_epoch}")
 
-    # ---- training loop ----
-    history: Dict[str, List[float]] = {'train_loss': [], 'val_loss': [], 'lr': []}
+    # ---- history & metric definitions ----
+    history: Dict[str, List] = {
+        'train_loss': [], 'val_loss': [], 'val_ref_mse': [],
+        'train_rank_me': [], 'val_rank_me': [],
+        'lr': [],
+    }
 
     metric_definitions = {
         'train_loss': 'Mean MAE reconstruction loss on training batches.',
         'val_loss': 'Mean MAE reconstruction loss on validation batches.',
+        'val_ref_mse': 'Reference MSE (normalized per-patch) on masked validation patches.',
+        'train_rank_me': (
+            'RankME effective rank of train embeddings (Garrido et al., ICML 2023). '
+            'Sanity-check: should track val_rank_me. null on non-triggered epochs.'
+        ),
+        'val_rank_me': (
+            'RankME effective rank of val embeddings (Garrido et al., ICML 2023). '
+            'exp(Shannon entropy of normalized singular values); higher = less collapsed. '
+            'null on epochs where rankme_every did not trigger.'
+        ),
         'lr': 'Learning rate before optimizer step.',
     }
 
-    out_json = results_json
-    if out_json is None and checkpoint_dir:
-        out_json = os.path.join(checkpoint_dir, 'mae_training_run.json')
+    # ---- restore history from existing JSON (enables correct resume) ----
+    if start_epoch > 0 and out_json and os.path.isfile(out_json):
+        try:
+            with open(out_json, 'r', encoding='utf-8') as _f:
+                _saved = json.load(_f).get('metrics_per_epoch', {})
+            for key in history:
+                if key in _saved and isinstance(_saved[key], list):
+                    history[key] = list(_saved[key][:start_epoch])
+            print(f"Restored {len(history['train_loss'])} epochs of history from {out_json}")
+        except Exception as _e:
+            print(f"Warning: could not load history from {out_json}: {_e}")
 
     if out_json:
         dump_mae_training_results(
@@ -1133,19 +1253,34 @@ def train_mae(
         train_loss = _train_one_epoch(
             model, train_loader, optimizer, device, mask_ratio, epoch, scaler,
         )
-        val_loss = _validate(model, val_loader, device, mask_ratio)
+        val_loss, val_ref_mse = _validate(model, val_loader, device, mask_ratio)
+
+        if rankme_every > 0 and (epoch + 1) % rankme_every == 0:
+            train_rank_me = compute_rank_me(collect_embeddings(model, train_loader, device))
+            val_rank_me   = compute_rank_me(collect_embeddings(model, val_loader, device))
+        else:
+            train_rank_me = val_rank_me = None
 
         scheduler.step()
 
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
+        history['val_ref_mse'].append(val_ref_mse)
+        history['train_rank_me'].append(train_rank_me)
+        history['val_rank_me'].append(val_rank_me)
         history['lr'].append(current_lr)
 
+        _rm = (
+            f" | rank_me(tr/val)={train_rank_me:.1f}/{val_rank_me:.1f}"
+            if val_rank_me is not None else ""
+        )
         print(
             f"Epoch {epoch:3d}/{epochs} | "
             f"train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | "
+            f"val_ref_mse={val_ref_mse:.4f} | "
             f"lr={current_lr:.2e}"
+            + _rm
         )
 
         if on_epoch_end is not None:
@@ -1159,11 +1294,19 @@ def train_mae(
                 epoch, train_loss, val_loss, path,
             )
             print(f"  → checkpoint saved: {path}")
+            if out_json:
+                dump_mae_training_results(
+                    out_json, model=model, history=history,
+                    training_config=training_config, metric_definitions=metric_definitions,
+                )
             if train_transform_preview > 0:
                 _save_train_transform_previews(
                     train_ds, patch_size, checkpoint_dir,
                     epoch + 1, train_transform_preview,
                 )
+
+        if checkpoint_dir and plot_every > 0 and (epoch + 1) % plot_every == 0:
+            save_mae_training_plots(history, checkpoint_dir)
 
     # ---- final checkpoint ----
     if checkpoint_dir:
@@ -1176,7 +1319,6 @@ def train_mae(
         )
         print(f"Final checkpoint saved: {path}")
 
-    
     if out_json:
         dump_mae_training_results(
             out_json,
@@ -1185,6 +1327,9 @@ def train_mae(
             training_config=training_config,
             metric_definitions=metric_definitions,
         )
+
+    if checkpoint_dir and plot_every > 0:
+        save_mae_training_plots(history, checkpoint_dir)
 
     return model, history
 

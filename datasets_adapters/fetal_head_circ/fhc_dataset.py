@@ -25,6 +25,15 @@ except ImportError:
     pass  # matplotlib not available
 
 
+def _find_image(directory: Path, stem: str) -> Optional[Path]:
+    """Return first existing PNG/JPG for *stem* in *directory*, or None."""
+    for ext in ('.png', '.jpg', '.jpeg'):
+        p = directory / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
 class FetalHeadCircDataset(Dataset):
     """
     Dataset class for Fetal Head Circumference grayscale ultrasound images.
@@ -56,6 +65,7 @@ class FetalHeadCircDataset(Dataset):
         transform: Optional[List[Callable]] = None,
         load_annotations: bool = True,
         target_size: Optional[Any] = None,  # deprecated, ignored
+        preprocessed: bool = False,
     ):
         if target_size is not None:
             warnings.warn(
@@ -64,13 +74,21 @@ class FetalHeadCircDataset(Dataset):
                 "the MAE pipeline (apply_max_height_shrink + mae_pad_collate).",
                 DeprecationWarning, stacklevel=2,
             )
-        self.images_dir = Path(images_dir)
+        images_dir_path = Path(images_dir)
+        self.preprocessed = preprocessed
+        # Annotations always come from the original images_dir
+        self.images_dir = images_dir_path
+        if preprocessed:
+            prep_name = images_dir_path.name + '_preprocessed'
+            self.load_dir = images_dir_path.parent / prep_name
+        else:
+            self.load_dir = images_dir_path
         self.csv_file = Path(csv_file)
         self.load_annotations = load_annotations
-        
+
         # Validate paths
-        if not self.images_dir.exists():
-            raise FileNotFoundError(f"Images directory does not exist: {self.images_dir}")
+        if not self.load_dir.exists():
+            raise FileNotFoundError(f"Images directory does not exist: {self.load_dir}")
         
         if not self.csv_file.exists():
             raise FileNotFoundError(f"CSV file does not exist: {self.csv_file}")
@@ -93,12 +111,12 @@ class FetalHeadCircDataset(Dataset):
             filename = row['filename']
             # Remove .png extension if present (CSV might have it)
             image_name = filename.replace('.png', '')
-            image_path = self.images_dir / f"{image_name}.png"
-            
-            if image_path.exists():
+            image_path = _find_image(self.load_dir, image_name)
+
+            if image_path is not None:
                 self.image_paths.append(image_path)
-                
-                # Try to load annotation if requested
+
+                # Try to load annotation if requested (always from original dir)
                 annotation_path = None
                 if self.load_annotations:
                     annotation_path = self.images_dir / f"{image_name}_Annotation.png"
@@ -118,7 +136,7 @@ class FetalHeadCircDataset(Dataset):
                     'image_name': image_name
                 })
             else:
-                print(f"Warning: Image not found: {image_path}")
+                print(f"Warning: Image not found for {image_name} in {self.load_dir}")
         
         if len(self.image_paths) == 0:
             raise ValueError(f"No valid images found in {self.images_dir}")

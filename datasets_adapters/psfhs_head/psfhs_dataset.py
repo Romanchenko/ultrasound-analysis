@@ -144,6 +144,7 @@ class PSFHSDataset(Dataset):
         images_dir: str = "image_mha",
         masks_dir: str = "label_mha",
         target_size: Optional[Any] = None,  # deprecated, ignored
+        preprocessed: bool = False,
     ):
         if target_size is not None:
             warnings.warn(
@@ -158,8 +159,12 @@ class PSFHSDataset(Dataset):
         self.mask_target = mask_target
         self.images_dir_name = images_dir
         self.masks_dir_name = masks_dir
+        self.preprocessed = preprocessed
 
-        self.images_dir = self.root / images_dir
+        if preprocessed:
+            self.images_dir = self.root / (images_dir + '_preprocessed')
+        else:
+            self.images_dir = self.root / images_dir
         self.masks_dir = self.root / masks_dir
 
         if not self.images_dir.exists():
@@ -168,10 +173,16 @@ class PSFHSDataset(Dataset):
         self.image_paths: List[Path] = []
         self.image_ids: List[str] = []
 
-        for p in sorted(self.images_dir.iterdir()):
-            if p.suffix.lower() == ".mha":
-                self.image_paths.append(p)
-                self.image_ids.append(p.stem)
+        if preprocessed:
+            for p in sorted(self.images_dir.iterdir()):
+                if p.suffix.lower() in ('.png', '.jpg', '.jpeg'):
+                    self.image_paths.append(p)
+                    self.image_ids.append(p.stem)
+        else:
+            for p in sorted(self.images_dir.iterdir()):
+                if p.suffix.lower() == ".mha":
+                    self.image_paths.append(p)
+                    self.image_ids.append(p.stem)
 
         if load_masks and not self.masks_dir.exists():
             raise FileNotFoundError(
@@ -191,7 +202,8 @@ class PSFHSDataset(Dataset):
             self.image_ids = valid_ids
 
         if len(self.image_paths) == 0:
-            raise ValueError(f"No valid .mha images found in {self.images_dir}")
+            fmt = "PNG/JPG" if preprocessed else ".mha"
+            raise ValueError(f"No valid {fmt} images found in {self.images_dir}")
 
         print(f"Loaded {len(self.image_paths)} images from {self.images_dir}")
 
@@ -232,11 +244,17 @@ class PSFHSDataset(Dataset):
         image_path = self.image_paths[idx]
         image_id = self.image_ids[idx]
 
-        try:
-            arr = _read_mha(image_path)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load {image_path}: {e}") from e
-        image = _array_to_pil_gray(arr)
+        if self.preprocessed:
+            try:
+                image = Image.open(image_path).convert("L")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load {image_path}: {e}") from e
+        else:
+            try:
+                arr = _read_mha(image_path)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load {image_path}: {e}") from e
+            image = _array_to_pil_gray(arr)
 
         if not self.load_masks:
             if callable(self.transform):

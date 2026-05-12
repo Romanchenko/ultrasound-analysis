@@ -5,11 +5,16 @@ Iterates over DICOM files inside ZIP archives without extracting them.
 Returns grayscale images as {'image': [1, H, W] float32 tensor in [0, 1]}.
 Labels/patient metadata are ignored.
 
-Dataset structure:
+Dataset structure (raw):
     root_dir/
         studies/
             {STUDY_NAME}.zip   (one per study)
                 /{study_folder}/images/dicom/*.dcm
+
+Dataset structure (preprocessed):
+    root_dir/
+        studies_preprocessed/
+            {stem}.png   (flat directory of PNGs from the pipeline)
 """
 
 import io
@@ -18,41 +23,62 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-import pydicom
 import torch
 from torch.utils.data import Dataset
+from PIL import Image
 
 
 class ClinicalStudiesDataset(Dataset):
     """
-    PyTorch Dataset over DICOM files stored inside ZIP archives.
+    PyTorch Dataset over DICOM files stored inside ZIP archives, or preprocessed PNGs.
 
-    All DICOM files are indexed at init; each __getitem__ opens the ZIP,
-    reads the single member, and returns a tensor — no full extraction.
+    Raw mode: indexes DICOMs inside ZIPs; each __getitem__ opens the ZIP on demand.
+    Preprocessed mode (``preprocessed=True``): reads flat PNG/JPG files from
+    ``{studies_subdir}_preprocessed/`` sibling directory produced by the pipeline.
 
     Args:
-        root: Root directory containing a `studies/` subdirectory with .zip files.
+        root: Root directory.
         studies_subdir: Name of the subdir holding ZIPs (default 'studies').
+        preprocessed: If True, load from ``{studies_subdir}_preprocessed/`` as PNG/JPG.
     """
 
-    def __init__(self, root: str, *, studies_subdir: str = "studies"):
+    def __init__(
+        self,
+        root: str,
+        *,
+        studies_subdir: str = "studies",
+        preprocessed: bool = False,
+    ):
         self.root = Path(root)
-        self.studies_dir = self.root / studies_subdir
+        self.preprocessed = preprocessed
 
-        if not self.studies_dir.exists():
-            raise FileNotFoundError(f"Studies directory not found: {self.studies_dir}")
-
-        # Index: list of (zip_path, member_path_inside_zip)
-        self._index: List[Tuple[Path, str]] = []
-        self._scan_zips()
-
-        if len(self._index) == 0:
-            raise ValueError(f"No DICOM files found under {self.studies_dir}")
-
-        print(
-            f"ClinicalStudiesDataset: {len(self._index)} DICOM files across "
-            f"{len(list(self.studies_dir.glob('*.zip')))} ZIP archives"
-        )
+        if preprocessed:
+            self.prep_dir = self.root / (studies_subdir + '_preprocessed')
+            if not self.prep_dir.exists():
+                raise FileNotFoundError(
+                    f"Preprocessed directory not found: {self.prep_dir}"
+                )
+            self._prep_paths: List[Path] = sorted(
+                p for p in self.prep_dir.iterdir()
+                if p.suffix.lower() in ('.png', '.jpg', '.jpeg')
+            )
+            if len(self._prep_paths) == 0:
+                raise ValueError(f"No PNG/JPG files found in {self.prep_dir}")
+            print(f"ClinicalStudiesDataset: {len(self._prep_paths)} preprocessed images from {self.prep_dir}")
+        else:
+            import pydicom  # noqa: F401  # ensure available before indexing
+            self.studies_dir = self.root / studies_subdir
+            if not self.studies_dir.exists():
+                raise FileNotFoundError(f"Studies directory not found: {self.studies_dir}")
+            # Index: list of (zip_path, member_path_inside_zip)
+            self._index: List[Tuple[Path, str]] = []
+            self._scan_zips()
+            if len(self._index) == 0:
+                raise ValueError(f"No DICOM files found under {self.studies_dir}")
+            print(
+                f"ClinicalStudiesDataset: {len(self._index)} DICOM files across "
+                f"{len(list(self.studies_dir.glob('*.zip')))} ZIP archives"
+            )
 
     def _scan_zips(self) -> None:
         for zip_path in sorted(self.studies_dir.glob("*.zip")):
@@ -65,9 +91,17 @@ class ClinicalStudiesDataset(Dataset):
                 print(f"Warning: skipping bad ZIP {zip_path.name}")
 
     def __len__(self) -> int:
+        if self.preprocessed:
+            return len(self._prep_paths)
         return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        if self.preprocessed:
+            img = Image.open(self._prep_paths[idx]).convert("L")
+            import torchvision.transforms as T
+            return {"image": T.ToTensor()(img)}
+
+        import pydicom
         zip_path, member = self._index[idx]
         with zipfile.ZipFile(zip_path, "r") as zf:
             with zf.open(member) as f:

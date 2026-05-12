@@ -15,6 +15,15 @@ from pathlib import Path
 import torchvision.transforms as transforms
 
 
+def _find_image(directory: Path, stem: str) -> Optional[Path]:
+    """Return first existing PNG/JPG for *stem* in *directory*, or None."""
+    for ext in ('.png', '.jpg', '.jpeg'):
+        p = directory / f"{stem}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
 def composite_plane_label(plane: str, brain_plane: str) -> str:
     """
     Canonical string label for the pair (Plane, Brain_plane).
@@ -63,6 +72,7 @@ class FetalPlanesDBDataset(Dataset):
         train: Optional[bool] = None,
         class_to_idx: Optional[Dict[str, int]] = None,
         target_size: Optional[Any] = None,  # deprecated, ignored
+        preprocessed: bool = False,
     ):
         if target_size is not None:
             warnings.warn(
@@ -73,7 +83,11 @@ class FetalPlanesDBDataset(Dataset):
                 DeprecationWarning, stacklevel=2,
             )
         self.root = Path(root)
-        self.images_dir = self.root / images_dir
+        self.preprocessed = preprocessed
+        if preprocessed:
+            self.images_dir = self.root / (images_dir + '_preprocessed')
+        else:
+            self.images_dir = self.root / images_dir
         self.csv_path = self.root / csv_file
         self.class_to_idx = class_to_idx
         self.idx_to_class = {v: k for k, v in class_to_idx.items()} if class_to_idx else None
@@ -97,9 +111,9 @@ class FetalPlanesDBDataset(Dataset):
         self.labels = []
         for idx, row in self.df.iterrows():
             image_name = row['Image_name']
-            image_path = self.images_dir / f"{image_name}.png"
-            
-            if image_path.exists():
+            image_path = _find_image(self.images_dir, image_name)
+
+            if image_path is not None:
                 plane = str(row.get('Plane', '') or '')
                 brain_plane = str(row.get('Brain_plane', '') or '')
                 comp = composite_plane_label(plane, brain_plane)
@@ -118,7 +132,7 @@ class FetalPlanesDBDataset(Dataset):
                     'Image_name': image_name
                 })
             else:
-                print(f"Warning: Image not found: {image_path}")
+                print(f"Warning: Image not found for {image_name} in {self.images_dir}")
         
         if len(self.image_paths) == 0:
             raise ValueError(f"No valid images found in {self.images_dir}")
