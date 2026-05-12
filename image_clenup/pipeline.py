@@ -5,14 +5,15 @@ For each source image:
   1. Load as grayscale (JPG/PNG/DCM/DICOM-in-ZIP/MHA/NPY)
   2. Normalise: clip to [1st, 99th] percentile, then scale to [0, 1]
   3. Apply conus mask (zero non-US region) — skipped if no checkpoint given
-  4. Save as 8-bit PNG at native resolution to OUTPUT_DIR
-  5. Write/append manifest.csv
+  4. Save as 8-bit PNG at native resolution to the mapped output directory
+  5. Write/append manifest.csv (one per output directory)
 
 Images are NOT resized — native resolution is preserved.
 Resizing is the model's responsibility at training time.
 
-Designed to be idempotent: files already present in manifest are skipped
-when SKIP_EXISTING=1 (default).
+Accepts a source→destination mapping so each input folder writes its
+preprocessed PNGs to a dedicated sibling folder.  Designed to be idempotent:
+files already present in a manifest are skipped when skip_existing=True.
 """
 
 import csv
@@ -314,33 +315,41 @@ _MANIFEST_COLS = [
 
 
 def run_pipeline(
-    source_paths: List[str],
-    output_dir: str,
+    source_mapping: Dict[str, str],
     conus_checkpoint: Optional[str] = None,
     workers: int = 4,
     batch_size_gpu: int = 16,
     skip_existing: bool = True,
     device=None,
     conus_threshold: float = 0.5,
-) -> str:
+) -> Dict[str, str]:
     """
-    Run the preprocessing pipeline.
+    Run the preprocessing pipeline for a source→destination mapping.
 
-    Images are saved at their native resolution — no resizing.
-    The model is responsible for any resize/crop at training time.
+    Args:
+        source_mapping: dict mapping each source directory (or file) to its
+                        output directory, e.g.
+                        ``{"/data/image_mha": "/data/image_mha_preprocessed"}``.
+        conus_checkpoint: path to a ConusUNet checkpoint, or None to skip masking.
+        workers: number of I/O threads for parallel loading.
+        batch_size_gpu: images per GPU forward pass for the conus model.
+        skip_existing: skip files already recorded as ``ok`` in the manifest.
+        device: torch device; auto-detected when None.
+        conus_threshold: binary threshold for conus mask.
 
-    Returns the path to the manifest CSV.
+    Returns:
+        Dict mapping each output directory to the path of its ``manifest.csv``.
     """
     import torch
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = output_dir / "manifest.csv"
+    mapping: Dict[Path, Path] = {
+        Path(s.strip()): Path(d.strip()) for s, d in source_mapping.items()
+    }
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load conus model
+    # Load conus model once
     conus_model = None
     if conus_checkpoint:
         conus_ckpt = Path(conus_checkpoint)
@@ -355,41 +364,60 @@ def run_pipeline(
             conus_model.eval()
             logger.info("Loaded conus model from %s", conus_ckpt)
 
-    # Read existing manifest to know which dst_paths already done
+    # Per-output-dir: create dirs, open CSV writers, read existing dsts
     existing_dsts: set = set()
-    if skip_existing and manifest_path.exists():
-        with open(manifest_path, newline="") as f:
-            for row in csv.DictReader(f):
-                if row.get("status") == "ok":
-                    existing_dsts.add(row["dst_path"])
+    writers:   Dict[Path, csv.DictWriter] = {}
+    csv_files: Dict[Path, object] = {}
+    manifest_paths: Dict[str, str] = {}
 
-    # Discover source files
-    all_files = _discover_files(source_paths)
-    logger.info("Discovered %d source files", len(all_files))
+    for dst_dir in mapping.values():
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = dst_dir / "manifest.csv"
+        manifest_paths[str(dst_dir)] = str(manifest_path)
 
-    # Open manifest CSV for appending
-    csv_exists = manifest_path.exists()
-    csv_file = open(manifest_path, "a", newline="")
-    writer = csv.DictWriter(csv_file, fieldnames=_MANIFEST_COLS)
-    if not csv_exists:
-        writer.writeheader()
+        if skip_existing and manifest_path.exists():
+            with open(manifest_path, newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("status") == "ok":
+                        existing_dsts.add(row["dst_path"])
+
+        csv_existed = manifest_path.exists()
+        fh = open(manifest_path, "a", newline="")
+        w = csv.DictWriter(fh, fieldnames=_MANIFEST_COLS)
+        if not csv_existed:
+            w.writeheader()
+        writers[dst_dir] = w
+        csv_files[dst_dir] = fh
+
+    # Discover all (src, dst_dir) pairs
+    all_tasks: List[Tuple[Path, Path]] = []
+    for src_dir, dst_dir in mapping.items():
+        for f in _discover_files([str(src_dir)]):
+            all_tasks.append((f, dst_dir))
+    logger.info("Discovered %d source files across %d source dirs", len(all_tasks), len(mapping))
 
     # Process files in parallel (I/O) → collect rows with arrays
     pending_rows: List[Dict] = []
     n_skipped = n_error = n_queued = 0
 
-    def _process_and_collect(src):
-        return _process_one(src, output_dir, skip_existing=False)
+    def _process_and_collect(src: Path, dst_dir: Path) -> List[Dict]:
+        rows = _process_one(src, dst_dir, skip_existing=False)
+        for r in rows:
+            r["_dst_dir"] = dst_dir
+        return rows
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_process_and_collect, f): f for f in all_files}
+        futures = {pool.submit(_process_and_collect, src, dst_dir): None
+                   for src, dst_dir in all_tasks}
         for fut in as_completed(futures):
             for row in fut.result():
                 dst = row["dst_path"]
+                writer = writers[row["_dst_dir"]]
+                fh = csv_files[row["_dst_dir"]]
                 if row["status"] == "load_error":
                     n_error += 1
                     _write_row(writer, row)
-                    csv_file.flush()
+                    fh.flush()
                 elif skip_existing and dst in existing_dsts:
                     n_skipped += 1
                 elif row.get("_arr") is None:
@@ -417,6 +445,8 @@ def run_pipeline(
 
         for row, arr, cov in zip(batch, arrs, coverages):
             dst = Path(row["dst_path"])
+            writer = writers[row["_dst_dir"]]
+            fh = csv_files[row["_dst_dir"]]
             try:
                 dst.write_bytes(_to_png_bytes(arr))
                 row["conus_coverage_pct"] = f"{cov:.1f}" if cov != "" else ""
@@ -426,18 +456,22 @@ def run_pipeline(
                 logger.warning("Save error %s: %s", dst, exc)
                 row["status"] = "save_error"
             _write_row(writer, row)
-        csv_file.flush()
+        for fh in csv_files.values():
+            fh.flush()
 
         done = min(batch_start + batch_size_gpu, len(pending_rows))
         print(f"\r  Processed {done}/{len(pending_rows)}...", end="", flush=True)
 
     print()
-    csv_file.close()
+    for fh in csv_files.values():
+        fh.close()
 
-    logger.info("Done: %d saved, %d skipped, %d errors", n_ok, n_skipped, n_error)
-    print(f"Saved {n_ok} images to {output_dir}")
-    print(f"Manifest: {manifest_path}")
-    return str(manifest_path)
+    total_out = len(mapping)
+    logger.info("Done: %d saved, %d skipped, %d errors across %d output dir(s)",
+                n_ok, n_skipped, n_error, total_out)
+    for dst_dir, mpath in manifest_paths.items():
+        print(f"  {dst_dir}  →  {mpath}")
+    return manifest_paths
 
 
 def _write_row(writer: csv.DictWriter, row: Dict) -> None:

@@ -86,6 +86,12 @@ _eval_flag = os.environ.get("EVAL_ONLY", "").strip().lower() in ("1", "true", "y
 MODE = "eval" if _eval_flag else _mode_raw
 DEVICE = os.environ.get("DEVICE", "").strip()
 RANDOM_ENCODER = os.environ.get("RANDOM_ENCODER", "0").strip().lower() in ("1", "true", "yes")
+# When True, apply the same in-memory preprocessing as the pipeline:
+#   percentile normalisation (1st–99th), then optional conus masking.
+PREPROCESS_IMAGES = os.environ.get("PREPROCESS_IMAGES", "0").strip().lower() in ("1", "true", "yes")
+# Path to a ConusUNet checkpoint for in-memory masking (only used when
+# PREPROCESS_IMAGES=1; leave empty to skip masking and do percentile norm only).
+CONUS_CHECKPOINT = os.environ.get("CONUS_CHECKPOINT", "").strip() or None
 
 if DEVICE:
     device = torch.device(DEVICE)
@@ -115,34 +121,41 @@ def _standardize_per_image(img: torch.Tensor, eps: float = 1e-6) -> torch.Tensor
 
 
 def load_npy_as_grayscale_tensor(
-    path: str, max_image_height: int, standardize: bool = True,
+    path: str,
+    max_image_height: int,
+    standardize: bool = True,
+    percentile_norm: bool = False,
 ) -> torch.Tensor:
     """Load a ``.npy`` RGB image, convert to grayscale ``[1, H, W]`` float tensor.
 
     * Raw pixels are scaled to ``[0, 1]``.
+    * If ``percentile_norm`` is True, apply pipeline's 1st–99th percentile
+      normalisation on the raw array before converting to tensor.
     * If ``H > max_image_height``, shrink so ``H = max_image_height`` (aspect
       ratio kept; never upscaled, never letterboxed).
-    * If ``standardize`` is True (default), apply per-image z-score so the
-      tensor matches the distribution the MAE encoder was pre-trained on
-      (see ``embeddings.vit.train.standardize_per_image``). This flag must
-      be set identically at MAE pre-training and at classification time.
+    * If ``standardize`` is True (default), apply per-image z-score.
     """
-    import torchvision.transforms.functional as F
+    import torchvision.transforms.functional as TF
+    from image_clenup.pipeline import _percentile_norm
 
     npy = np.load(path)
     if npy.dtype != np.uint8:
         npy = np.clip(npy, 0, 255).astype(np.uint8)
 
-    img = Image.fromarray(npy, mode="RGB").convert("L")
-    tensor = torch.from_numpy(np.array(img)).float().unsqueeze(0) / 255.0
+    arr = np.asarray(Image.fromarray(npy, mode="RGB").convert("L"), dtype=np.float32) / 255.0
+
+    if percentile_norm:
+        arr = _percentile_norm(arr)
+
+    tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, H, W]
 
     _, h, w = tensor.shape
     if max_image_height and h > max_image_height:
         new_h = int(max_image_height)
         new_w = max(1, int(round(w * new_h / h)))
-        tensor = F.resize(
+        tensor = TF.resize(
             tensor, [new_h, new_w],
-            interpolation=F.InterpolationMode.BILINEAR,
+            interpolation=TF.InterpolationMode.BILINEAR,
             antialias=True,
         )
 
@@ -197,6 +210,7 @@ class ClassificationDataset(Dataset):
         exclude_class_ids: Optional[Set[int]] = None,
         image_ext: str = "",
         standardize: bool = True,
+        percentile_norm: bool = False,
     ):
         if exclude_class_ids is None:
             exclude_class_ids = set()
@@ -225,6 +239,7 @@ class ClassificationDataset(Dataset):
 
         self.max_image_height = max_image_height
         self.standardize = bool(standardize)
+        self.percentile_norm = bool(percentile_norm)
 
     def __len__(self) -> int:
         return len(self.data)
@@ -232,7 +247,9 @@ class ClassificationDataset(Dataset):
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, int, str]:
         entry = self.data[index]
         img = load_npy_as_grayscale_tensor(
-            entry["img"], self.max_image_height, standardize=self.standardize,
+            entry["img"], self.max_image_height,
+            standardize=self.standardize,
+            percentile_norm=self.percentile_norm,
         )
         return img, entry["seq_idx"], entry["img"]
 
@@ -279,6 +296,43 @@ class MAEClassifier(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# In-memory conus masking
+# ---------------------------------------------------------------------------
+
+def _conus_mask_batch(
+    model,
+    images: torch.Tensor,
+    pad_masks: torch.Tensor,
+    device_: torch.device,
+    threshold: float = 0.5,
+) -> torch.Tensor:
+    """Apply ConusUNet to a padded batch, delegating to pipeline._apply_conus_batch.
+
+    Extracts each image's unpadded region using ``pad_masks``, passes them as a
+    list of numpy arrays to the pipeline function, then writes the masked arrays
+    back into the (cloned) padded batch tensor.
+    """
+    from image_clenup.pipeline import _apply_conus_batch
+
+    arrs, sizes = [], []
+    for i in range(images.shape[0]):
+        valid = ~pad_masks[i, 0]
+        rows = valid.any(dim=1).nonzero(as_tuple=True)[0]
+        cols = valid.any(dim=0).nonzero(as_tuple=True)[0]
+        h = int(rows[-1]) + 1 if len(rows) else images.shape[2]
+        w = int(cols[-1]) + 1 if len(cols) else images.shape[3]
+        arrs.append(images[i, 0, :h, :w].cpu().numpy())
+        sizes.append((h, w))
+
+    masked_arrs, _ = _apply_conus_batch(model, arrs, device_, threshold)
+
+    result = images.clone()
+    for i, (arr, (h, w)) in enumerate(zip(masked_arrs, sizes)):
+        result[i, 0, :h, :w] = torch.from_numpy(arr).to(images.dtype)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Training utilities
 # ---------------------------------------------------------------------------
 
@@ -289,6 +343,7 @@ def train_one_epoch(
     criterion: nn.Module,
     device_: torch.device,
     epoch: int,
+    conus_model=None,
 ) -> Tuple[float, float, float]:
     """Returns ``(mean_loss, accuracy, balanced_accuracy)`` on the training set."""
     model.train()
@@ -303,6 +358,8 @@ def train_one_epoch(
         imgs = imgs.to(device_)
         pad_masks = pad_masks.to(device_)
         labels = labels.to(device_)
+        if conus_model is not None:
+            imgs = _conus_mask_batch(conus_model, imgs, pad_masks, device_)
 
         optimizer.zero_grad()
         logits = model(imgs, pad_mask=pad_masks)
@@ -332,6 +389,7 @@ def evaluate(
     loader: DataLoader,
     criterion: nn.Module,
     device_: torch.device,
+    conus_model=None,
 ) -> Tuple[float, float, np.ndarray, np.ndarray]:
     """Returns ``(loss, accuracy, y_true, y_pred)``."""
     model.eval()
@@ -345,6 +403,8 @@ def evaluate(
         imgs = imgs.to(device_)
         pad_masks = pad_masks.to(device_)
         labels = labels.to(device_)
+        if conus_model is not None:
+            imgs = _conus_mask_batch(conus_model, imgs, pad_masks, device_)
 
         logits = model(imgs, pad_mask=pad_masks)
         loss = criterion(logits, labels)
@@ -601,9 +661,10 @@ def _load_head_checkpoint(path, model, optimizer=None):
 # Main
 # ---------------------------------------------------------------------------
 
-def _final_evaluate(model, val_loader, val_ds, ds, criterion):
+def _final_evaluate(model, val_loader, val_ds, ds, criterion, conus_model=None):
     """Run evaluation on the val set, print metrics, and save result files."""
-    val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, device)
+    val_loss, val_acc, y_true, y_pred = evaluate(model, val_loader, criterion, device,
+                                                  conus_model=conus_model)
     val_paths = [ds.data[idx]["img"] for idx in val_ds.indices]
     metrics = compute_and_print_metrics(y_true, y_pred, ds.class_names, ds.num_classes)
     save_results(metrics, y_true, y_pred, val_paths, ds.class_names)
@@ -650,6 +711,25 @@ def main():
     embed_dim = encoder.embed_dim
     print(f"Encoder embed_dim={embed_dim}, loaded from {TIMM_MODEL or ckpt_info.get('epoch', '?')}")
 
+    # Load conus model if in-memory preprocessing is requested
+    conus_model = None
+    if PREPROCESS_IMAGES:
+        print("In-memory preprocessing: percentile normalisation ON")
+        if CONUS_CHECKPOINT:
+            from pathlib import Path as _Path
+            _ckpt = _Path(CONUS_CHECKPOINT)
+            if not _ckpt.exists():
+                print(f"WARNING: CONUS_CHECKPOINT not found: {_ckpt} — conus masking disabled")
+            else:
+                from image_clenup.conus_detection.model import ConusUNet
+                from image_clenup.conus_detection.train import load_checkpoint as _load_conus
+                conus_model = ConusUNet().to(device)
+                _load_conus(str(_ckpt), conus_model, optimizer=None)
+                conus_model.eval()
+                print(f"Conus model loaded from {_ckpt}")
+        else:
+            print("  (no CONUS_CHECKPOINT set — skipping conus masking)")
+
     ds = ClassificationDataset(
         dir_images=DIR_IMAGES,
         path_csv=PATH_CSV,
@@ -657,6 +737,7 @@ def main():
         exclude_class_ids=exclude_ids,
         image_ext=IMAGE_EXT,
         standardize=STANDARDIZE_INPUT,
+        percentile_norm=PREPROCESS_IMAGES,
     )
     print(
         f"Input standardisation: {'ON' if STANDARDIZE_INPUT else 'OFF'} "
@@ -707,7 +788,7 @@ def main():
         print("\n" + "=" * 60)
         print("EVALUATION RESULTS")
         print("=" * 60)
-        _final_evaluate(model, val_loader, val_ds, ds, criterion)
+        _final_evaluate(model, val_loader, val_ds, ds, criterion, conus_model=conus_model)
         return
 
     # ===================================================================
@@ -770,9 +851,11 @@ def main():
     for epoch in range(start_epoch, EPOCHS + 1):
         train_loss, train_acc, train_bal_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device, epoch,
+            conus_model=conus_model,
         )
         val_loss, val_acc, y_true, y_pred = evaluate(
             model, val_loader, criterion, device,
+            conus_model=conus_model,
         )
         val_bal_acc = balanced_accuracy_score(y_true, y_pred) if len(y_true) > 0 else 0.0
         val_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0) if len(y_true) > 0 else 0.0
@@ -813,7 +896,7 @@ def main():
     print("FINAL RESULTS (best checkpoint on validation set)")
     print("=" * 60)
 
-    metrics = _final_evaluate(model, val_loader, val_ds, ds, criterion)
+    metrics = _final_evaluate(model, val_loader, val_ds, ds, criterion, conus_model=conus_model)
     save_run_config(train_config, history, final_metrics=metrics, path=CONFIG_PATH)
 
 
