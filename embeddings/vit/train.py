@@ -56,7 +56,6 @@ import torchvision.transforms as T
 from tqdm import tqdm
 
 from embeddings.vit.model import MaskedAutoencoderViT, create_mae_vit
-from embeddings.rank_me import compute_rank_me
 
 
 def apply_max_height_shrink(
@@ -1244,18 +1243,12 @@ def train_mae(
         history['train_rank_me'].append(train_rank_me)
         history['val_rank_me'].append(val_rank_me)
         history['lr'].append(current_lr)
-
-        _rm = (
-            f" | rank_me(tr/val)={train_rank_me:.1f}/{val_rank_me:.1f}"
-            if val_rank_me is not None else ""
-        )
         print(
             f"Epoch {epoch:3d}/{epochs} | "
             f"train_loss={train_loss:.4f} | "
             f"val_loss={val_loss:.4f} | "
             f"val_ref_mse={val_ref_mse:.4f} | "
             f"lr={current_lr:.2e}"
-            + _rm
         )
 
         if on_epoch_end is not None:
