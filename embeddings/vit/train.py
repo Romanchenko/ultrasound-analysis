@@ -56,7 +56,7 @@ import torchvision.transforms as T
 from tqdm import tqdm
 
 from embeddings.vit.model import MaskedAutoencoderViT, create_mae_vit
-from embeddings.rank_me import compute_rank_me, collect_embeddings
+from embeddings.rank_me import compute_rank_me
 
 
 def apply_max_height_shrink(
@@ -887,7 +887,7 @@ def dump_mae_training_metrics_artifacts(
 
 def save_mae_training_plots(history: Dict, out_dir: str) -> str:
     """
-    Save a PNG with loss, reference MSE, RankME (when available), and LR panels.
+    Save a PNG with loss, reference MSE, and LR panels.
     Overwrites ``{out_dir}/training_plots.png`` each call.
 
     Returns the path written.
@@ -900,8 +900,7 @@ def save_mae_training_plots(history: Dict, out_dir: str) -> str:
     if n == 0:
         return ""
     xs = range(1, n + 1)
-    has_rankme = any(v is not None for v in history.get('val_rank_me', []))
-    ncols = 3 + int(has_rankme)
+    ncols = 3
 
     fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
 
@@ -924,17 +923,6 @@ def save_mae_training_plots(history: Dict, out_dir: str) -> str:
     ax.set_title('LR Schedule')
     ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
     ax.grid(True, alpha=0.3)
-
-    if has_rankme:
-        ax = axes[3]
-        rm_xs  = [i + 1 for i, v in enumerate(history['val_rank_me'])   if v is not None]
-        rm_tr  = [v      for v in history['train_rank_me'] if v is not None]
-        rm_val = [v      for v in history['val_rank_me']   if v is not None]
-        ax.plot(rm_xs, rm_tr,  'o-', label='train', linewidth=1.5, markersize=4)
-        ax.plot(rm_xs, rm_val, 'o-', label='val',   linewidth=1.5, markersize=4)
-        ax.set_xlabel('Epoch'); ax.set_ylabel('Effective rank')
-        ax.set_title('RankME')
-        ax.legend(); ax.grid(True, alpha=0.3)
 
     fig.suptitle(f"MAE training — epoch {n}", fontsize=11, y=1.01)
     fig.tight_layout()
@@ -1215,15 +1203,6 @@ def train_mae(
         'train_loss': 'Mean MAE reconstruction loss on training batches.',
         'val_loss': 'Mean MAE reconstruction loss on validation batches.',
         'val_ref_mse': 'Reference MSE (normalized per-patch) on masked validation patches.',
-        'train_rank_me': (
-            'RankME effective rank of train embeddings (Garrido et al., ICML 2023). '
-            'Sanity-check: should track val_rank_me. null on non-triggered epochs.'
-        ),
-        'val_rank_me': (
-            'RankME effective rank of val embeddings (Garrido et al., ICML 2023). '
-            'exp(Shannon entropy of normalized singular values); higher = less collapsed. '
-            'null on epochs where rankme_every did not trigger.'
-        ),
         'lr': 'Learning rate before optimizer step.',
     }
 
@@ -1255,11 +1234,7 @@ def train_mae(
         )
         val_loss, val_ref_mse = _validate(model, val_loader, device, mask_ratio)
 
-        if rankme_every > 0 and (epoch + 1) % rankme_every == 0:
-            train_rank_me = compute_rank_me(collect_embeddings(model, train_loader, device))
-            val_rank_me   = compute_rank_me(collect_embeddings(model, val_loader, device))
-        else:
-            train_rank_me = val_rank_me = None
+        train_rank_me = val_rank_me = None
 
         scheduler.step()
 
