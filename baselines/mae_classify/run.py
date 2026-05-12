@@ -136,7 +136,6 @@ def load_npy_as_grayscale_tensor(
     * If ``standardize`` is True (default), apply per-image z-score.
     """
     import torchvision.transforms.functional as TF
-    from image_clenup.pipeline import _percentile_norm
 
     npy = np.load(path)
     if npy.dtype != np.uint8:
@@ -145,6 +144,7 @@ def load_npy_as_grayscale_tensor(
     arr = np.asarray(Image.fromarray(npy, mode="RGB").convert("L"), dtype=np.float32) / 255.0
 
     if percentile_norm:
+        from image_clenup.pipeline import _percentile_norm
         arr = _percentile_norm(arr)
 
     tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, H, W]
