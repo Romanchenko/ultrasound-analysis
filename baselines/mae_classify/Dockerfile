@@ -47,6 +47,7 @@ COPY image_clenup/__init__.py                        image_clenup/__init__.py
 COPY image_clenup/pipeline.py                        image_clenup/pipeline.py
 COPY image_clenup/conus_detection/__init__.py        image_clenup/conus_detection/__init__.py
 COPY image_clenup/conus_detection/model.py           image_clenup/conus_detection/model.py
+COPY image_clenup/conus_detection/dataset.py         image_clenup/conus_detection/dataset.py
 COPY image_clenup/conus_detection/train.py           image_clenup/conus_detection/train.py
 
 # Copy both classification scripts
