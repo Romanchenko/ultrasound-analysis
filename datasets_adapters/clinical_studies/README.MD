@@ -56,3 +56,26 @@ Content of A10026-meta.json for instance:
   }
 }
 ```
+
+
+Preprocessed files structure:
+```
+/root_dir
+    /meta
+        all-meta.json
+    /studies
+        /{STUDY_NAME}.zip
+        ...
+    /studies_first_frame
+        /{STUDY_NAME}
+          /{STUDY_NAME}
+            /meta
+              /json
+                  /{STUDY_ID}-meta.json
+              /csv
+                  /{STUDY_ID}-meta.csv
+            /images
+              /dicom
+                /{IMAGE_NAME}.jpg
+                ...
+```

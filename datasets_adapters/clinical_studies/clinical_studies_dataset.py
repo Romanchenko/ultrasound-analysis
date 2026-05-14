@@ -8,22 +8,25 @@ Labels/patient metadata are ignored.
 Dataset structure (raw):
     root_dir/
         studies/
-            {STUDY_NAME}.zip   (one per study)
-                /{study_folder}/images/dicom/*.dcm
+            {STUDY_NAME}.zip
+                /{STUDY_NAME}/images/dicom/*.dcm
 
-Dataset structure (preprocessed):
+Dataset structure (preprocessed — studies_first_frame pipeline):
     root_dir/
-        studies_preprocessed/
-            {stem}.png   (flat directory of PNGs from the pipeline)
+        studies_first_frame/
+            {STUDY_NAME}/
+                {STUDY_NAME}/
+                    images/dicom/*.png   (4-D DICOMs collapsed to first frame)
 """
 
 import io
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torchvision.transforms as T
 from torch.utils.data import Dataset
 from PIL import Image
 
@@ -33,13 +36,16 @@ class ClinicalStudiesDataset(Dataset):
     PyTorch Dataset over DICOM files stored inside ZIP archives, or preprocessed PNGs.
 
     Raw mode: indexes DICOMs inside ZIPs; each __getitem__ opens the ZIP on demand.
-    Preprocessed mode (``preprocessed=True``): reads flat PNG/JPG files from
-    ``{studies_subdir}_preprocessed/`` sibling directory produced by the pipeline.
+    Preprocessed mode (``preprocessed=True``): recursively finds PNG/JPG images under
+    the preprocessed directory (handles both flat and nested structures).
 
     Args:
         root: Root directory.
         studies_subdir: Name of the subdir holding ZIPs (default 'studies').
-        preprocessed: If True, load from ``{studies_subdir}_preprocessed/`` as PNG/JPG.
+        preprocessed: If True, load from a preprocessed image directory as PNG/JPG.
+        prep_subdir: Name of the preprocessed directory. Defaults to
+            ``{studies_subdir}_preprocessed``. Pass ``'studies_first_frame'``
+            to read output from the 4-D first-frame pipeline.
     """
 
     def __init__(
@@ -48,19 +54,21 @@ class ClinicalStudiesDataset(Dataset):
         *,
         studies_subdir: str = "studies",
         preprocessed: bool = False,
+        prep_subdir: Optional[str] = None,
     ):
         self.root = Path(root)
         self.preprocessed = preprocessed
 
         if preprocessed:
-            self.prep_dir = self.root / (studies_subdir + '_preprocessed')
+            resolved = prep_subdir if prep_subdir is not None else (studies_subdir + '_preprocessed')
+            self.prep_dir = self.root / resolved
             if not self.prep_dir.exists():
                 raise FileNotFoundError(
                     f"Preprocessed directory not found: {self.prep_dir}"
                 )
             self._prep_paths: List[Path] = sorted(
-                p for p in self.prep_dir.iterdir()
-                if p.suffix.lower() in ('.png', '.jpg', '.jpeg')
+                p for p in self.prep_dir.rglob("*")
+                if p.is_file() and p.suffix.lower() in ('.png', '.jpg', '.jpeg')
             )
             if len(self._prep_paths) == 0:
                 raise ValueError(f"No PNG/JPG files found in {self.prep_dir}")
@@ -98,7 +106,6 @@ class ClinicalStudiesDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         if self.preprocessed:
             img = Image.open(self._prep_paths[idx]).convert("L")
-            import torchvision.transforms as T
             return {"image": T.ToTensor()(img)}
 
         import pydicom
